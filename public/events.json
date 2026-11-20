@@ -1,0 +1,32 @@
+[
+  {
+    "id": "fomc-min-nov",
+    "date": "2026-11-18",
+    "timeUtc": "19:00",
+    "name": "FOMC Min"
+  },
+  {
+    "id": "fed-chair-nov",
+    "date": "2026-11-19",
+    "timeUtc": "15:00",
+    "name": "Fed Chair"
+  },
+  {
+    "id": "cpi-release-nov",
+    "date": "2026-11-20",
+    "timeUtc": "13:30",
+    "name": "CPI"
+  },
+  {
+    "id": "pce-nov",
+    "date": "2026-11-25",
+    "timeUtc": "13:30",
+    "name": "PCE"
+  },
+  {
+    "id": "fomc-rate-dec",
+    "date": "2026-12-09",
+    "timeUtc": "19:00",
+    "name": "FOMC"
+  }
+]
