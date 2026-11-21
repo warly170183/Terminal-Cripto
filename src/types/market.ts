@@ -63,6 +63,35 @@ export type HorizontalLevel = {
   source: 'prev_high' | 'prev_low' | 'user';
 };
 
+export type ChartDrawMode = 'crosshair' | 'horizontal' | 'trendline' | 'ray' | 'marker';
+
+export type ChartAnchorPoint = {
+  timeSec: number; // Unix timestamp in seconds (supports future projection over Prediction Cone)
+  price: number;
+};
+
+export type UserTrendLine = {
+  id: string;
+  kind: 'segment' | 'ray';
+  p1: ChartAnchorPoint;
+  p2: ChartAnchorPoint;
+  color: string;
+  label?: string;
+  createdAt: number;
+};
+
+export type MarkerFollowStatus = 'pendiente' | 'cumplido' | 'invalidado';
+
+export type UserChartMarker = {
+  id: string;
+  timeSec: number;
+  price: number;
+  label: string;
+  color: string;
+  status: MarkerFollowStatus;
+  createdAt: number;
+};
+
 export type LayerVisibility = {
   emaClouds: boolean;
   ema9: boolean;

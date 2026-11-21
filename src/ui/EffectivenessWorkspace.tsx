@@ -7,7 +7,6 @@ import {
   CheckCircle2,
   Clock,
   ExternalLink,
-  History,
   RefreshCw,
   ShieldCheck,
   Target,
@@ -29,6 +28,10 @@ import { fetchTechnicalMarketCandles, type TechnicalMarketMode } from '../data/o
 import { useTerminalStore } from '../store/terminalStore';
 import type { Candle, SymbolAsset, Timeframe } from '../types/market';
 import { SignalStrategyStackedDashboard } from './components/SignalStrategyStackedDashboard';
+import {
+  clearAutoAuditDismissed,
+  markAutoAuditDismissed,
+} from './hooks/useAutoSignalTracker';
 
 type OriginFilter = 'all' | 'live' | 'audit';
 type AssetFilter = 'all' | SymbolAsset;
@@ -458,7 +461,6 @@ export function EffectivenessWorkspace() {
     scoringConfig,
     setActiveTab,
     trackedSignals,
-    recordTrackedSignals,
     replaceTrackedSignals,
     clearTrackedSignals,
   } = useTerminalStore();
@@ -472,19 +474,18 @@ export function EffectivenessWorkspace() {
 
   const [syncing, setSyncing] = useState(false);
   const [auditing, setAuditing] = useState(false);
-  const [feedbackMsg, setFeedbackMsg] = useState<string | null>(null);
   const [confirmClear, setConfirmClear] = useState(false);
+  const [clearedManually, setClearedManually] = useState(false);
 
   const marketMode: TechnicalMarketMode = scoringConfig.mode === 'perpetual' ? 'perp' : 'spot';
 
   // Re-evaluate all persisted signals against real OKX candles for each unique (asset, timeframe, marketMode)
   const reevaluateAllWithOkx = useCallback(
-    async (targetHorizon = horizonBars, silent = false) => {
+    async (targetHorizon = horizonBars) => {
       const currentSignals = useTerminalStore.getState().trackedSignals;
       if (currentSignals.length === 0) return;
 
       setSyncing(true);
-      if (!silent) setFeedbackMsg(null);
 
       try {
         const pairKeys = new Map<
@@ -523,7 +524,8 @@ export function EffectivenessWorkspace() {
         });
 
         const now = Date.now();
-        const updated = currentSignals.map((sig) => {
+        const latestSignals = useTerminalStore.getState().trackedSignals;
+        const updated = latestSignals.map((sig) => {
           const key = `${sig.asset}|${sig.timeframe}|${sig.marketMode}`;
           const c = candlesByPair.get(key);
           if (!c || c.length === 0) return sig;
@@ -531,17 +533,8 @@ export function EffectivenessWorkspace() {
         });
 
         replaceTrackedSignals(updated);
-        if (!silent) {
-          setFeedbackMsg(
-            `Reevaluadas ${updated.length} señales contra velas reales de OKX (${entries.length} serie${entries.length === 1 ? '' : 's'}).`
-          );
-        }
-      } catch (err) {
-        if (!silent) {
-          setFeedbackMsg(
-            err instanceof Error ? err.message : 'Error consultando velas OKX para reevaluar.'
-          );
-        }
+      } catch {
+        // Silent retry on next automatic 25s interval
       } finally {
         setSyncing(false);
       }
@@ -549,65 +542,115 @@ export function EffectivenessWorkspace() {
     [horizonBars, replaceTrackedSignals]
   );
 
-  // Sync automatically on initial mount if signals exist
+  // Run walk-forward real historical candle audit on current asset & timeframe
+  const runAutoOkxAudit = useCallback(
+    async (targetHorizon = horizonBars) => {
+      setAuditing(true);
+      try {
+        const state = useTerminalStore.getState();
+        const activeOkxCandles =
+          state.candlesDatasetKey === `${asset}|${timeframe}` && state.candles.length >= 90
+            ? state.candles
+            : await fetchTechnicalMarketCandles(asset, timeframe, marketMode, 300);
+
+        if (activeOkxCandles.length < 90) return;
+
+        const spotRef =
+          ticker?.idxPx ??
+          candles[candles.length - 1]?.c ??
+          activeOkxCandles[activeOkxCandles.length - 1].c;
+        const strikes = aggregateStrikes(options, spotRef, 'ALL');
+        const optLvls = calculateLevels(strikes, options, spotRef);
+
+        const audited = auditHistoricalSignalsFromCandles({
+          asset,
+          timeframe,
+          marketMode: scoringConfig.mode,
+          candles: activeOkxCandles,
+          horizonBars: targetHorizon,
+          stepBars: 8,
+          capitalUsd: scoringConfig.capitalUsd,
+          riskPct: scoringConfig.riskPct,
+          optionsLevels: optLvls,
+        });
+
+        if (audited.length > 0) {
+          const merged = mergeSignalsIntoHistory(
+            useTerminalStore.getState().trackedSignals,
+            audited
+          );
+          replaceTrackedSignals(merged);
+        }
+      } catch {
+        // Non-fatal: retries automatically on next cycle
+      } finally {
+        setAuditing(false);
+      }
+    },
+    [
+      asset,
+      timeframe,
+      marketMode,
+      horizonBars,
+      ticker?.idxPx,
+      candles,
+      options,
+      scoringConfig.mode,
+      scoringConfig.capitalUsd,
+      scoringConfig.riskPct,
+      replaceTrackedSignals,
+    ]
+  );
+
+  // Automatic initial load + continuous 25s background OKX re-evaluation
   useEffect(() => {
-    if (trackedSignals.length > 0) {
-      void reevaluateAllWithOkx(horizonBars, true);
+    let active = true;
+
+    async function autoSyncNow() {
+      const current = useTerminalStore.getState().trackedSignals;
+      const hasPairAudit = current.some(
+        (s) =>
+          s.origin === 'audit' &&
+          s.asset === asset &&
+          s.timeframe === timeframe &&
+          s.marketMode === scoringConfig.mode
+      );
+
+      if (!hasPairAudit && !clearedManually && originFilter !== 'live') {
+        await runAutoOkxAudit(horizonBars);
+      }
+      if (active && useTerminalStore.getState().trackedSignals.length > 0) {
+        await reevaluateAllWithOkx(horizonBars);
+      }
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+
+    void autoSyncNow();
+    const intervalId = setInterval(() => {
+      if (active) {
+        void reevaluateAllWithOkx(horizonBars);
+      }
+    }, 25_000);
+
+    return () => {
+      active = false;
+      clearInterval(intervalId);
+    };
+  }, [
+    asset,
+    timeframe,
+    scoringConfig.mode,
+    horizonBars,
+    clearedManually,
+    originFilter,
+    runAutoOkxAudit,
+    reevaluateAllWithOkx,
+  ]);
 
   // Re-evaluate immediately when user switches evaluation horizon
   const handleHorizonChange = (nextH: number) => {
     setHorizonBars(nextH);
     if (trackedSignals.length > 0) {
-      void reevaluateAllWithOkx(nextH, false);
-    }
-  };
-
-  // Run walk-forward real historical candle audit on current asset & timeframe
-  const handleRunOkxAudit = async () => {
-    setAuditing(true);
-    setFeedbackMsg(null);
-    try {
-      const okxCandles = await fetchTechnicalMarketCandles(asset, timeframe, marketMode, 300);
-      if (okxCandles.length < 90) {
-        setFeedbackMsg('No hay suficientes velas históricas en OKX para auditar este marco temporal.');
-        return;
-      }
-
-      const spotRef = ticker?.idxPx ?? candles[candles.length - 1]?.c ?? okxCandles[okxCandles.length - 1].c;
-      const strikes = aggregateStrikes(options, spotRef, 'ALL');
-      const optLvls = calculateLevels(strikes, options, spotRef);
-
-      const audited = auditHistoricalSignalsFromCandles({
-        asset,
-        timeframe,
-        marketMode: scoringConfig.mode,
-        candles: okxCandles,
-        horizonBars,
-        stepBars: 8,
-        capitalUsd: scoringConfig.capitalUsd,
-        riskPct: scoringConfig.riskPct,
-        optionsLevels: optLvls,
-      });
-
-      if (audited.length === 0) {
-        setFeedbackMsg('No se generaron señales en la ventana histórica auditada.');
-        return;
-      }
-
-      const merged = mergeSignalsIntoHistory(useTerminalStore.getState().trackedSignals, audited);
-      replaceTrackedSignals(merged);
-      setFeedbackMsg(
-        `Auditoría walk-forward completada: +${audited.length} señales históricas reales (${asset} ${timeframe}) evaluadas vela a vela.`
-      );
-    } catch (err) {
-      setFeedbackMsg(
-        err instanceof Error ? err.message : 'Error ejecutando auditoría histórica en OKX.'
-      );
-    } finally {
-      setAuditing(false);
+      void reevaluateAllWithOkx(nextH);
     }
   };
 
@@ -662,9 +705,6 @@ export function EffectivenessWorkspace() {
     [trackedSignals]
   );
 
-  // Unused import guard cleanup helper (recordTrackedSignals is available if needed)
-  void recordTrackedSignals;
-
   return (
     <div className="flex-1 overflow-y-auto bg-[#0B0E14] text-slate-200">
       <div className="max-w-7xl mx-auto p-4 sm:p-6 space-y-5">
@@ -673,13 +713,13 @@ export function EffectivenessWorkspace() {
           <div className="space-y-1">
             <div className="flex items-center gap-2 text-xs font-mono-tabular text-emerald-400">
               <ShieldCheck className="w-4 h-4 shrink-0" />
-              <span>EVALUACIÓN DE EFECTIVIDAD · SEGUIMIENTO REAL vs VELAS OKX</span>
+              <span>EVALUACIÓN DE EFECTIVIDAD · SEGUIMIENTO AUTOMÁTICO OKX</span>
             </div>
             <h1 className="text-lg font-semibold text-white">
               Índice de Efectividad de Señales ({summary.effectivenessIndexPct !== null ? `${summary.effectivenessIndexPct.toFixed(1)}%` : 'Sin evaluar'})
             </h1>
             <p className="text-xs text-slate-400 max-w-2xl">
-              Recopila automáticamente las señales generadas en{' '}
+              Recopila automáticamente en segundo plano las señales generadas en{' '}
               <button
                 type="button"
                 onClick={() => setActiveTab('trading_options')}
@@ -688,32 +728,18 @@ export function EffectivenessWorkspace() {
                 Opciones de Trading
               </button>{' '}
               ({liveCount} en vivo · {auditCount} en auditoría) y las contrasta vela a vela contra el
-              desarrollo posterior real en OKX para validar si las señales técnicas se cumplen.
+              desarrollo posterior real en OKX.
             </p>
           </div>
 
-          <div className="flex flex-wrap items-center gap-2 text-xs">
+          <div className="flex flex-wrap items-center gap-2.5 text-xs">
             <button
               type="button"
-              onClick={() => void reevaluateAllWithOkx(horizonBars, false)}
-              disabled={syncing || trackedSignals.length === 0}
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded bg-[#0B0E11] hover:bg-[#19202D] disabled:opacity-45 border border-white/[0.1] text-slate-200 whitespace-nowrap shrink-0"
+              onClick={() => setActiveTab('trading_options')}
+              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded bg-[#0B0E11] hover:bg-[#19202D] border border-white/[0.08] text-sky-300 whitespace-nowrap shrink-0"
             >
-              <RefreshCw className={`w-3.5 h-3.5 ${syncing ? 'animate-spin' : ''}`} />
-              <span>Reevaluar OKX</span>
-            </button>
-
-            <button
-              type="button"
-              onClick={() => void handleRunOkxAudit()}
-              disabled={auditing}
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded bg-[#3B82F6] hover:bg-blue-500 disabled:opacity-50 text-white font-medium whitespace-nowrap shrink-0"
-              title={`Ejecuta auditoría walk-forward sobre las últimas velas reales de ${asset} (${timeframe})`}
-            >
-              <History className={`w-3.5 h-3.5 ${auditing ? 'animate-spin' : ''}`} />
-              <span>
-                {auditing ? 'Auditando OKX...' : `Auditar histórico ${asset} ${timeframe}`}
-              </span>
+              <span>Opciones de Trading</span>
+              <ExternalLink className="w-3.5 h-3.5" />
             </button>
 
             {trackedSignals.length > 0 && !confirmClear && (
@@ -735,8 +761,9 @@ export function EffectivenessWorkspace() {
                   type="button"
                   onClick={() => {
                     clearTrackedSignals(originFilter === 'all' ? undefined : originFilter);
+                    markAutoAuditDismissed();
+                    setClearedManually(true);
                     setConfirmClear(false);
-                    setFeedbackMsg('Registro limpiado.');
                   }}
                   className="px-2 py-0.5 rounded bg-rose-600 text-white text-[11px] font-medium"
                 >
@@ -753,19 +780,6 @@ export function EffectivenessWorkspace() {
             )}
           </div>
         </section>
-
-        {feedbackMsg && (
-          <div className="bg-[#12161E] border border-sky-500/30 rounded-lg px-3.5 py-2 text-xs text-sky-200 flex items-center justify-between gap-2">
-            <span>{feedbackMsg}</span>
-            <button
-              type="button"
-              onClick={() => setFeedbackMsg(null)}
-              className="text-slate-400 hover:text-white text-[11px]"
-            >
-              Cerrar
-            </button>
-          </div>
-        )}
 
         {/* Filter & Horizon Control Bar */}
         <section className="bg-[#12161E] border border-white/[0.08] rounded-lg px-4 py-2.5 flex flex-wrap items-center justify-between gap-3 text-xs">
@@ -864,38 +878,48 @@ export function EffectivenessWorkspace() {
         {trackedSignals.length === 0 ? (
           <section className="bg-[#12161E] border border-white/[0.08] rounded-lg p-8 text-center space-y-4">
             <div className="w-10 h-10 rounded-lg bg-[#0B0E11] border border-white/[0.08] mx-auto flex items-center justify-center text-sky-400">
-              <Target className="w-5 h-5" />
+              {syncing || auditing ? (
+                <RefreshCw className="w-5 h-5 animate-spin text-emerald-400" />
+              ) : (
+                <Target className="w-5 h-5" />
+              )}
             </div>
             <div className="space-y-1 max-w-lg mx-auto">
               <h2 className="text-sm font-semibold text-white">
-                Todavía no hay señales de Opciones de Trading registradas
+                {syncing || auditing
+                  ? `Recopilando y evaluando señales automáticamente (${asset} ${timeframe})...`
+                  : 'Registro de señales vacío'}
               </h2>
               <p className="text-xs text-slate-400 leading-relaxed">
-                Cada vez que se generen escenarios en Opciones de Trading se guardarán aquí para
-                seguir vela a vela si alcanzan TP1, TP2 o Stop Loss. También puedes lanzar ahora una
-                auditoría walk-forward sobre las últimas velas reales de OKX para obtener el índice
-                inicial al instante.
+                {syncing || auditing
+                  ? 'Consultando velas reales de OKX para generar la base histórica y capturar los escenarios de Opciones de Trading sin intervención manual.'
+                  : 'Las nuevas señales generadas por Opciones de Trading seguirán registrándose automáticamente en cada nueva vela.'}
               </p>
             </div>
-            <div className="flex flex-wrap items-center justify-center gap-3">
-              <button
-                type="button"
-                onClick={() => void handleRunOkxAudit()}
-                disabled={auditing}
-                className="flex items-center gap-1.5 px-4 py-2 rounded bg-[#3B82F6] hover:bg-blue-500 text-white text-xs font-medium whitespace-nowrap"
-              >
-                <History className={`w-3.5 h-3.5 ${auditing ? 'animate-spin' : ''}`} />
-                <span>Auditar histórico real OKX ({asset} {timeframe})</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => setActiveTab('trading_options')}
-                className="flex items-center gap-1.5 px-4 py-2 rounded bg-[#0B0E11] hover:bg-[#19202D] border border-white/[0.1] text-slate-200 text-xs whitespace-nowrap"
-              >
-                <span>Ir a Opciones de Trading</span>
-                <ExternalLink className="w-3.5 h-3.5" />
-              </button>
-            </div>
+            {!syncing && !auditing && (
+              <div className="flex flex-wrap items-center justify-center gap-3">
+                <button
+                  type="button"
+                  onClick={() => {
+                    clearAutoAuditDismissed();
+                    setClearedManually(false);
+                    void runAutoOkxAudit(horizonBars);
+                  }}
+                  className="flex items-center gap-1.5 px-4 py-2 rounded bg-[#3B82F6] hover:bg-blue-500 text-white text-xs font-medium whitespace-nowrap"
+                >
+                  <RefreshCw className="w-3.5 h-3.5" />
+                  <span>Reactivar evaluación automática ({asset} {timeframe})</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setActiveTab('trading_options')}
+                  className="flex items-center gap-1.5 px-4 py-2 rounded bg-[#0B0E11] hover:bg-[#19202D] border border-white/[0.1] text-slate-200 text-xs whitespace-nowrap"
+                >
+                  <span>Ver Opciones de Trading</span>
+                  <ExternalLink className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            )}
           </section>
         ) : (
           <>

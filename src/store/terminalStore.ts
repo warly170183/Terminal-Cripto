@@ -2,6 +2,8 @@ import { create } from 'zustand';
 import type {
   Candle,
   CandleTheme,
+  ChartAnchorPoint,
+  ChartDrawMode,
   HorizontalLevel,
   LayerVisibility,
   MacroEvent,
@@ -12,6 +14,8 @@ import type {
   SymbolAsset,
   TickerSnapshot,
   Timeframe,
+  UserChartMarker,
+  UserTrendLine,
 } from '../types/market';
 import type { PersistedScoringConfig } from '../types/scoring';
 import type { RawNewsHeadline } from '../calc/newsSentiment';
@@ -27,6 +31,8 @@ const STORAGE_KEYS = {
   timeframe: 'wterm_timeframe_v1',
   asset: 'wterm_asset_v1',
   userLevelsPrefix: 'wterm_levels_v1_',
+  userTrendLinesPrefix: 'wterm_trendlines_v1_',
+  userMarkersPrefix: 'wterm_markers_v1_',
   provider: 'wterm_provider_v1',
   candleTheme: 'wterm_candletheme_v1',
   scoringConfig: 'wterm_scoring_config_v1',
@@ -109,9 +115,13 @@ interface TerminalState {
   legendCollapsed: boolean;
   candleTheme: CandleTheme;
 
-  drawMode: 'crosshair' | 'horizontal';
+  drawMode: ChartDrawMode;
   userLevels: HorizontalLevel[];
   selectedLevelId: string | null;
+  userTrendLines: UserTrendLine[];
+  userMarkers: UserChartMarker[];
+  selectedTrendLineId: string | null;
+  selectedMarkerId: string | null;
 
   providerName: OptionsProviderName;
   options: OptionRow[];
@@ -154,12 +164,33 @@ interface TerminalState {
   setLegendCollapsed: (collapsed: boolean) => void;
   setCandleTheme: (theme: CandleTheme) => void;
 
-  setDrawMode: (mode: 'crosshair' | 'horizontal') => void;
+  setDrawMode: (mode: ChartDrawMode) => void;
   addUserLevel: (price: number) => void;
   updateUserLevelLabel: (id: string, label: string) => void;
   removeUserLevel: (id: string) => void;
   clearUserLevels: () => void;
   setSelectedLevelId: (id: string | null) => void;
+
+  addUserTrendLine: (
+    kind: 'segment' | 'ray',
+    p1: ChartAnchorPoint,
+    p2: ChartAnchorPoint,
+    color?: string,
+    label?: string
+  ) => void;
+  updateUserTrendLine: (id: string, patch: Partial<Pick<UserTrendLine, 'label' | 'color'>>) => void;
+  removeUserTrendLine: (id: string) => void;
+  setSelectedTrendLineId: (id: string | null) => void;
+
+  addUserMarker: (point: ChartAnchorPoint, label?: string, color?: string) => void;
+  updateUserMarker: (
+    id: string,
+    patch: Partial<Pick<UserChartMarker, 'label' | 'color' | 'status'>>
+  ) => void;
+  removeUserMarker: (id: string) => void;
+  setSelectedMarkerId: (id: string | null) => void;
+
+  clearAllUserDrawings: () => void;
 
   setProviderName: (name: OptionsProviderName) => void;
   setOptionsData: (options: OptionRow[], updatedAt: number) => void;
@@ -214,6 +245,10 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
   drawMode: 'crosshair',
   userLevels: loadJson<HorizontalLevel[]>(STORAGE_KEYS.userLevelsPrefix + initialAsset, []),
   selectedLevelId: null,
+  userTrendLines: loadJson<UserTrendLine[]>(STORAGE_KEYS.userTrendLinesPrefix + initialAsset, []),
+  userMarkers: loadJson<UserChartMarker[]>(STORAGE_KEYS.userMarkersPrefix + initialAsset, []),
+  selectedTrendLineId: null,
+  selectedMarkerId: null,
 
   providerName: loadJson<OptionsProviderName>(STORAGE_KEYS.provider, 'okx'),
   options: [],
@@ -252,13 +287,22 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
   setAsset: (asset) => {
     saveJson(STORAGE_KEYS.asset, asset);
     const loadedLevels = loadJson<HorizontalLevel[]>(STORAGE_KEYS.userLevelsPrefix + asset, []);
+    const loadedTrendLines = loadJson<UserTrendLine[]>(
+      STORAGE_KEYS.userTrendLinesPrefix + asset,
+      []
+    );
+    const loadedMarkers = loadJson<UserChartMarker[]>(STORAGE_KEYS.userMarkersPrefix + asset, []);
     set((state) => {
       const nextScoring = { ...state.scoringConfig, avwapAnchorLockTs: null };
       saveJson(STORAGE_KEYS.scoringConfig, nextScoring);
       return {
         asset,
         userLevels: loadedLevels,
+        userTrendLines: loadedTrendLines,
+        userMarkers: loadedMarkers,
         selectedLevelId: null,
+        selectedTrendLineId: null,
+        selectedMarkerId: null,
         options: [],
         optionTrades: [],
         orderbook: null,
@@ -350,7 +394,13 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
     };
     const next = [...userLevels, newLevel];
     saveJson(STORAGE_KEYS.userLevelsPrefix + asset, next);
-    set({ userLevels: next, selectedLevelId: newLevel.id, drawMode: 'crosshair' });
+    set({
+      userLevels: next,
+      selectedLevelId: newLevel.id,
+      selectedTrendLineId: null,
+      selectedMarkerId: null,
+      drawMode: 'crosshair',
+    });
   },
   updateUserLevelLabel: (id, label) => {
     const { asset, userLevels } = get();
@@ -372,7 +422,101 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
     saveJson(STORAGE_KEYS.userLevelsPrefix + asset, []);
     set({ userLevels: [], selectedLevelId: null });
   },
-  setSelectedLevelId: (selectedLevelId) => set({ selectedLevelId }),
+  setSelectedLevelId: (selectedLevelId) =>
+    set({ selectedLevelId, selectedTrendLineId: null, selectedMarkerId: null }),
+
+  addUserTrendLine: (kind, p1, p2, color = '#38BDF8', label) => {
+    const { asset, userTrendLines } = get();
+    const nextLine: UserTrendLine = {
+      id: `tl-${Date.now()}-${Math.round(p1.price)}`,
+      kind,
+      p1,
+      p2,
+      color,
+      label,
+      createdAt: Date.now(),
+    };
+    const next = [...userTrendLines, nextLine];
+    saveJson(STORAGE_KEYS.userTrendLinesPrefix + asset, next);
+    set({
+      userTrendLines: next,
+      selectedTrendLineId: nextLine.id,
+      selectedLevelId: null,
+      selectedMarkerId: null,
+      drawMode: 'crosshair',
+    });
+  },
+  updateUserTrendLine: (id, patch) => {
+    const { asset, userTrendLines } = get();
+    const next = userTrendLines.map((tl) => (tl.id === id ? { ...tl, ...patch } : tl));
+    saveJson(STORAGE_KEYS.userTrendLinesPrefix + asset, next);
+    set({ userTrendLines: next });
+  },
+  removeUserTrendLine: (id) => {
+    const { asset, userTrendLines, selectedTrendLineId } = get();
+    const next = userTrendLines.filter((tl) => tl.id !== id);
+    saveJson(STORAGE_KEYS.userTrendLinesPrefix + asset, next);
+    set({
+      userTrendLines: next,
+      selectedTrendLineId: selectedTrendLineId === id ? null : selectedTrendLineId,
+    });
+  },
+  setSelectedTrendLineId: (selectedTrendLineId) =>
+    set({ selectedTrendLineId, selectedLevelId: null, selectedMarkerId: null }),
+
+  addUserMarker: (point, label = 'Seg. Cono', color = '#FACC15') => {
+    const { asset, userMarkers } = get();
+    const nextMarker: UserChartMarker = {
+      id: `mk-${Date.now()}-${Math.round(point.price)}`,
+      timeSec: point.timeSec,
+      price: point.price,
+      label,
+      color,
+      status: 'pendiente',
+      createdAt: Date.now(),
+    };
+    const next = [...userMarkers, nextMarker];
+    saveJson(STORAGE_KEYS.userMarkersPrefix + asset, next);
+    set({
+      userMarkers: next,
+      selectedMarkerId: nextMarker.id,
+      selectedLevelId: null,
+      selectedTrendLineId: null,
+      drawMode: 'crosshair',
+    });
+  },
+  updateUserMarker: (id, patch) => {
+    const { asset, userMarkers } = get();
+    const next = userMarkers.map((mk) => (mk.id === id ? { ...mk, ...patch } : mk));
+    saveJson(STORAGE_KEYS.userMarkersPrefix + asset, next);
+    set({ userMarkers: next });
+  },
+  removeUserMarker: (id) => {
+    const { asset, userMarkers, selectedMarkerId } = get();
+    const next = userMarkers.filter((mk) => mk.id !== id);
+    saveJson(STORAGE_KEYS.userMarkersPrefix + asset, next);
+    set({
+      userMarkers: next,
+      selectedMarkerId: selectedMarkerId === id ? null : selectedMarkerId,
+    });
+  },
+  setSelectedMarkerId: (selectedMarkerId) =>
+    set({ selectedMarkerId, selectedLevelId: null, selectedTrendLineId: null }),
+
+  clearAllUserDrawings: () => {
+    const { asset } = get();
+    saveJson(STORAGE_KEYS.userLevelsPrefix + asset, []);
+    saveJson(STORAGE_KEYS.userTrendLinesPrefix + asset, []);
+    saveJson(STORAGE_KEYS.userMarkersPrefix + asset, []);
+    set({
+      userLevels: [],
+      userTrendLines: [],
+      userMarkers: [],
+      selectedLevelId: null,
+      selectedTrendLineId: null,
+      selectedMarkerId: null,
+    });
+  },
 
   setProviderName: (providerName) => {
     saveJson(STORAGE_KEYS.provider, providerName);

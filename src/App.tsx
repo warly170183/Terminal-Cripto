@@ -22,8 +22,10 @@ import { ScoringWorkspace } from './ui/ScoringWorkspace';
 import { TechnicalAnalysisWorkspace } from './ui/TechnicalAnalysisWorkspace';
 import { TopBar } from './ui/TopBar';
 import { TradingOptionsWorkspace } from './ui/TradingOptionsWorkspace';
+import { useAutoSignalTracker } from './ui/hooks/useAutoSignalTracker';
 
 export default function App() {
+  useAutoSignalTracker();
   const {
     activeTab,
     asset,
@@ -274,7 +276,7 @@ export default function App() {
 
       {activeTab === 'chart' || activeTab === 'main_chart' ? (
         <main className="flex flex-col lg:flex-row flex-1 min-h-0">
-          {activeTab === 'chart' && <DrawingToolbar />}
+          <DrawingToolbar />
           <ChartWorkspace mainChartOnly={activeTab === 'main_chart'} />
           {activeTab === 'chart' && <RightOptionsPanel />}
         </main>
