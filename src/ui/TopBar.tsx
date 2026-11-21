@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Calendar, ChevronDown, Layers, WifiOff } from 'lucide-react';
+import { Calendar, ChevronDown, Layers, Newspaper, WifiOff } from 'lucide-react';
+import { correlateNewsWithPriceAction } from '../calc/newsSentiment';
 import { getAvailableExpiries } from '../calc/options';
 import { useTerminalStore } from '../store/terminalStore';
 import type { LayerVisibility, SymbolAsset, Timeframe } from '../types/market';
@@ -52,6 +53,8 @@ export function TopBar() {
     setProviderName,
     events,
     setEventsModalOpen,
+    newsItems,
+    newsCandles1h,
   } = useTerminalStore();
 
   const [layersMenuOpen, setLayersMenuOpen] = useState(false);
@@ -93,6 +96,12 @@ export function TopBar() {
   const nextEvent = useMemo(() => {
     return events.find((e) => e.ts > nowMs) ?? null;
   }, [events, nowMs]);
+
+  const newsBadgeSummary = useMemo(() => {
+    if (newsItems.length === 0) return null;
+    const c1h = newsCandles1h.length >= 24 ? newsCandles1h : candles;
+    return correlateNewsWithPriceAction(newsItems.slice(0, 40), c1h, events, nowMs);
+  }, [newsItems, newsCandles1h, candles, events, nowMs]);
 
   return (
     <header className="flex flex-wrap items-center justify-between gap-3 px-3 sm:px-4 py-2 bg-[#111621] border-b border-white/[0.08] shrink-0">
@@ -142,6 +151,17 @@ export function TopBar() {
             }`}
           >
             Opciones de Trading
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveTab('effectiveness')}
+            className={`px-2.5 py-1 text-xs font-medium rounded transition-colors whitespace-nowrap shrink-0 ${
+              activeTab === 'effectiveness'
+                ? 'bg-[#1F2937] text-white'
+                : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            Evaluación de efectividad
           </button>
           <button
             type="button"
@@ -361,6 +381,36 @@ export function TopBar() {
               </button>
             </div>
           </>
+        )}
+
+        {/* News Sentiment quick pill alongside macro events */}
+        {newsBadgeSummary && (
+          <button
+            type="button"
+            onClick={() => setEventsModalOpen(true)}
+            className="flex items-center gap-1.5 text-xs text-slate-300 hover:text-white border-l border-white/[0.08] pl-3 whitespace-nowrap"
+            title={`Sentimiento noticias (${newsBadgeSummary.aggregateLabel} ${newsBadgeSummary.aggregateScore >= 0 ? '+' : ''}${newsBadgeSummary.aggregateScore}) · Abrir Centro Macro y Noticias`}
+          >
+            <Newspaper className="w-3.5 h-3.5 text-sky-400 shrink-0" />
+            <span className="text-slate-400 hidden xl:inline">Noticias:</span>
+            <span
+              className={`font-mono-tabular font-semibold ${
+                newsBadgeSummary.aggregateLabel === 'Alcista'
+                  ? 'text-emerald-300'
+                  : newsBadgeSummary.aggregateLabel === 'Bajista'
+                  ? 'text-rose-300'
+                  : 'text-amber-300'
+              }`}
+            >
+              {newsBadgeSummary.aggregateLabel} ({newsBadgeSummary.aggregateScore >= 0 ? '+' : ''}
+              {newsBadgeSummary.aggregateScore})
+            </span>
+            {newsBadgeSummary.pearson4h !== null && (
+              <span className="text-[11px] font-mono-tabular text-slate-400 hidden 2xl:inline">
+                r={newsBadgeSummary.pearson4h.toFixed(2)}
+              </span>
+            )}
+          </button>
         )}
 
         {/* Macro events countdown (clickable to edit events; hidden text if no upcoming events) */}

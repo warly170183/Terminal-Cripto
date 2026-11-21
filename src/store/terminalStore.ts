@@ -14,7 +14,13 @@ import type {
   Timeframe,
 } from '../types/market';
 import type { PersistedScoringConfig } from '../types/scoring';
+import type { RawNewsHeadline } from '../calc/newsSentiment';
 import type { StreamConnectionStatus } from '../data/okxMarketClient';
+import {
+  evaluateSignalAgainstCandles,
+  mergeSignalsIntoHistory,
+  type TrackedOptionSignal,
+} from '../calc/signalEffectiveness';
 
 const STORAGE_KEYS = {
   layers: 'wterm_layers_v1',
@@ -24,6 +30,7 @@ const STORAGE_KEYS = {
   provider: 'wterm_provider_v1',
   candleTheme: 'wterm_candletheme_v1',
   scoringConfig: 'wterm_scoring_config_v1',
+  trackedSignals: 'wterm_tracked_signals_v1',
 };
 
 const DEFAULT_SCORING_CONFIG: PersistedScoringConfig = {
@@ -78,10 +85,11 @@ export type ActiveWorkspaceTab =
   | 'main_chart'
   | 'technical'
   | 'trading_options'
+  | 'effectiveness'
   | 'scoring'
   | 'backtest'
   | 'architecture';
-export type RightPanelTab = 'Levels' | 'Live' | 'GEX';
+export type RightPanelTab = 'Levels' | 'Live' | 'GEX' | 'Macro';
 export type GexLadderMode = 'GEX' | 'DEX' | 'OI' | 'MultiMap';
 
 interface TerminalState {
@@ -118,6 +126,13 @@ interface TerminalState {
 
   events: MacroEvent[];
   eventsModalOpen: boolean;
+
+  newsItems: RawNewsHeadline[];
+  newsSources: string[];
+  newsCandles1h: Candle[];
+  newsUpdatedAt: number | null;
+  newsLoading: boolean;
+  newsError: string | null;
 
   scoringConfig: PersistedScoringConfig;
   setScoringConfig: (patch: Partial<PersistedScoringConfig>) => void;
@@ -158,6 +173,23 @@ interface TerminalState {
 
   setEvents: (events: MacroEvent[]) => void;
   setEventsModalOpen: (open: boolean) => void;
+
+  setNewsFeed: (items: RawNewsHeadline[], sources: string[], updatedAt: number) => void;
+  setNewsCandles1h: (candles: Candle[]) => void;
+  setNewsLoading: (loading: boolean) => void;
+  setNewsError: (err: string | null) => void;
+
+  trackedSignals: TrackedOptionSignal[];
+  recordTrackedSignals: (incoming: TrackedOptionSignal[]) => void;
+  reevaluateTrackedSignals: (
+    asset: SymbolAsset,
+    timeframe: Timeframe,
+    marketMode: 'perpetual' | 'spot',
+    candles: Candle[],
+    horizonBars?: number
+  ) => void;
+  replaceTrackedSignals: (signals: TrackedOptionSignal[]) => void;
+  clearTrackedSignals: (origin?: 'live' | 'audit') => void;
 }
 
 const initialAsset = loadJson<SymbolAsset>(STORAGE_KEYS.asset, 'BTC');
@@ -197,10 +229,18 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
   events: [],
   eventsModalOpen: false,
 
+  newsItems: [],
+  newsSources: [],
+  newsCandles1h: [],
+  newsUpdatedAt: null,
+  newsLoading: false,
+  newsError: null,
+
   scoringConfig: {
     ...DEFAULT_SCORING_CONFIG,
     ...loadJson<Partial<PersistedScoringConfig>>(STORAGE_KEYS.scoringConfig, {}),
   },
+  trackedSignals: loadJson<TrackedOptionSignal[]>(STORAGE_KEYS.trackedSignals, []),
   setScoringConfig: (patch) =>
     set((state) => {
       const next = { ...state.scoringConfig, ...patch };
@@ -349,4 +389,49 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
 
   setEvents: (events) => set({ events }),
   setEventsModalOpen: (eventsModalOpen) => set({ eventsModalOpen }),
+
+  setNewsFeed: (newsItems, newsSources, newsUpdatedAt) =>
+    set({ newsItems, newsSources, newsUpdatedAt, newsError: null }),
+  setNewsCandles1h: (newsCandles1h) => set({ newsCandles1h }),
+  setNewsLoading: (newsLoading) => set({ newsLoading }),
+  setNewsError: (newsError) => set({ newsError }),
+
+  recordTrackedSignals: (incoming) =>
+    set((state) => {
+      if (incoming.length === 0) return state;
+      const next = mergeSignalsIntoHistory(state.trackedSignals, incoming);
+      saveJson(STORAGE_KEYS.trackedSignals, next);
+      return { trackedSignals: next };
+    }),
+  reevaluateTrackedSignals: (asset, timeframe, marketMode, candles, horizonBars) =>
+    set((state) => {
+      if (candles.length === 0 || state.trackedSignals.length === 0) return state;
+      let changed = false;
+      const next = state.trackedSignals.map((sig) => {
+        if (
+          sig.asset === asset &&
+          sig.timeframe === timeframe &&
+          sig.marketMode === marketMode
+        ) {
+          changed = true;
+          return evaluateSignalAgainstCandles(sig, candles, horizonBars);
+        }
+        return sig;
+      });
+      if (!changed) return state;
+      saveJson(STORAGE_KEYS.trackedSignals, next);
+      return { trackedSignals: next };
+    }),
+  replaceTrackedSignals: (signals) => {
+    saveJson(STORAGE_KEYS.trackedSignals, signals);
+    set({ trackedSignals: signals });
+  },
+  clearTrackedSignals: (origin) =>
+    set((state) => {
+      const next = origin
+        ? state.trackedSignals.filter((s) => s.origin !== origin)
+        : [];
+      saveJson(STORAGE_KEYS.trackedSignals, next);
+      return { trackedSignals: next };
+    }),
 }));

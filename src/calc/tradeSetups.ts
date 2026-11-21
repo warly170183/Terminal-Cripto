@@ -6,10 +6,22 @@ import type {
   Timeframe,
   TradeOptionIdea,
   TradeScoringAssessment,
+  TradeTechnicalAlignment,
 } from '../types/market';
 import type { ParameterPoints, ScoringResult } from '../types/scoring';
+import type { TakerTapeSummary } from '../data/okxTechnicalClient';
 import { calculateTouchProbability, type ConeProjection } from './cone';
 import { calculateEMAClouds, calculateRSI, calculateVWAP } from './indicators';
+import type { CorrelationWindowDays } from './newsSentiment';
+import type {
+  ConfluenceZone,
+  FairValueGap,
+  FibonacciAnalysis,
+  MultiTimeframeRow,
+  OscillatorDivergence,
+  TechnicalSnapshotSummary,
+  VolumeProfileData,
+} from './technicalAnalysis';
 
 export function calculateATR(candles: Candle[], period = 14): number {
   if (candles.length < 2) {
@@ -273,6 +285,254 @@ function buildIdeaScoringAssessment(
   };
 }
 
+export type MacroRegimeInput = {
+  sentimentLabel: 'Alcista' | 'Bajista' | 'Neutral';
+  sentimentScore: number;
+  rollingR: number | null;
+  windowDays: CorrelationWindowDays;
+  volPct: number | null;
+};
+
+type TechnicalEnrichmentContext = {
+  spot: number;
+  volumeProfile?: VolumeProfileData | null;
+  fibAnalysis?: FibonacciAnalysis | null;
+  fvgs?: FairValueGap[];
+  confluences?: ConfluenceZone[];
+  divergences?: OscillatorDivergence[];
+  techSnapshot?: TechnicalSnapshotSummary | null;
+  mtfMatrix?: MultiTimeframeRow[];
+  takerTape?: TakerTapeSummary | null;
+  macroRegime?: MacroRegimeInput | null;
+};
+
+function buildTechnicalAlignmentAssessment(
+  idea: TradeOptionIdea,
+  ctx: TechnicalEnrichmentContext
+): TradeTechnicalAlignment | undefined {
+  const {
+    spot,
+    volumeProfile,
+    fibAnalysis,
+    fvgs = [],
+    confluences = [],
+    divergences = [],
+    techSnapshot,
+    mtfMatrix = [],
+    takerTape,
+    macroRegime,
+  } = ctx;
+
+  const hasAnyTechData =
+    Boolean(volumeProfile) ||
+    Boolean(fibAnalysis) ||
+    fvgs.length > 0 ||
+    confluences.length > 0 ||
+    divergences.length > 0 ||
+    Boolean(techSnapshot) ||
+    mtfMatrix.length > 0 ||
+    Boolean(takerTape) ||
+    Boolean(macroRegime);
+
+  if (!hasAnyTechData) return undefined;
+
+  const isLong = idea.direction === 'LONG';
+  const alignedFactors: string[] = [];
+  const conflictingFactors: string[] = [];
+  let scoreDelta = 0;
+
+  // 1. Multi-Timeframe Matrix (15m / 1H / 4H / D)
+  let mtfAlignedCount = 0;
+  let mtfOpposeCount = 0;
+  for (const row of mtfMatrix) {
+    if (isLong) {
+      if (row.overall === 'Alcista') mtfAlignedCount++;
+      else if (row.overall === 'Bajista') mtfOpposeCount++;
+    } else {
+      if (row.overall === 'Bajista') mtfAlignedCount++;
+      else if (row.overall === 'Alcista') mtfOpposeCount++;
+    }
+  }
+  if (mtfMatrix.length > 0) {
+    if (mtfAlignedCount >= 3) {
+      scoreDelta += 8;
+      alignedFactors.push(`Matriz MTF ${mtfAlignedCount}/${mtfMatrix.length} TF alineados`);
+    } else if (mtfAlignedCount >= 2) {
+      scoreDelta += 4;
+      alignedFactors.push(`Matriz MTF ${mtfAlignedCount}/${mtfMatrix.length} TF a favor`);
+    } else if (mtfOpposeCount >= 2) {
+      scoreDelta -= 6;
+      conflictingFactors.push(`${mtfOpposeCount}/${mtfMatrix.length} TF en dirección contraria`);
+    }
+  }
+
+  // 2. Real-time Technical Snapshot (EMA/RSI/MACD/Book/BB Squeeze)
+  if (techSnapshot) {
+    if ((isLong && techSnapshot.overallBias === 'Alcista') || (!isLong && techSnapshot.overallBias === 'Bajista')) {
+      scoreDelta += 4;
+      alignedFactors.push(
+        `Sesgo técnico ${techSnapshot.overallBias} (${techSnapshot.bullishSignalsCount}↑/${techSnapshot.bearishSignalsCount}↓)`
+      );
+    } else if (
+      (isLong && techSnapshot.overallBias === 'Bajista') ||
+      (!isLong && techSnapshot.overallBias === 'Alcista')
+    ) {
+      scoreDelta -= 4;
+      conflictingFactors.push(`Sesgo multi-factor opuesto (${techSnapshot.overallBias})`);
+    }
+    if (techSnapshot.isSqueeze) {
+      conflictingFactors.push('BB Squeeze activo: posible expansión brusca de volatilidad');
+    }
+  }
+
+  // 3. Confluence Entry Tag (Cluster, Fib Golden Pocket, FVG, VPVR VAH/VAL/POC)
+  let confluenceEntryTag: string | null = null;
+  const entryCluster = confluences.find(
+    (z) => Math.abs(z.avgPrice - idea.entry) / idea.entry <= 0.0045
+  );
+  if (entryCluster) {
+    scoreDelta += 6;
+    confluenceEntryTag = `Clúster ${entryCluster.factorCount}× (${entryCluster.factors.slice(0, 3).join(' + ')})`;
+    alignedFactors.push(`Entrada sobre ${confluenceEntryTag}`);
+  }
+
+  if (fibAnalysis && idea.entry > 0) {
+    const inGoldenPocket =
+      idea.entry >= fibAnalysis.goldenPocketLow * 0.997 &&
+      idea.entry <= fibAnalysis.goldenPocketHigh * 1.003;
+    if (inGoldenPocket) {
+      scoreDelta += 5;
+      if (!confluenceEntryTag) confluenceEntryTag = 'Golden Pocket Fib 61.8%–65%';
+      alignedFactors.push('Zona Golden Pocket Fib (61.8%–65%)');
+    }
+  }
+
+  const entryFvg = fvgs.find(
+    (g) =>
+      ((isLong && g.direction === 'bullish') || (!isLong && g.direction === 'bearish')) &&
+      idea.entry >= g.bottom * 0.996 &&
+      idea.entry <= g.top * 1.004
+  );
+  if (entryFvg) {
+    scoreDelta += 4;
+    if (!confluenceEntryTag) {
+      confluenceEntryTag = `FVG ${entryFvg.direction === 'bullish' ? 'alcista' : 'bajista'}`;
+    }
+    alignedFactors.push(`Respaldo en FVG sin mitigar (${entryFvg.direction === 'bullish' ? 'alcista' : 'bajista'})`);
+  }
+
+  if (volumeProfile && spot > 0) {
+    const nearVal = Math.abs(idea.entry - volumeProfile.val) / idea.entry <= 0.0045;
+    const nearVah = Math.abs(idea.entry - volumeProfile.vah) / idea.entry <= 0.0045;
+    const nearPoc = Math.abs(idea.entry - volumeProfile.poc) / idea.entry <= 0.0045;
+    if (isLong && nearVal) {
+      scoreDelta += 3;
+      alignedFactors.push(`Soporte VPVR VAL ($${Math.round(volumeProfile.val).toLocaleString('en-US')})`);
+    } else if (!isLong && nearVah) {
+      scoreDelta += 3;
+      alignedFactors.push(`Techo VPVR VAH ($${Math.round(volumeProfile.vah).toLocaleString('en-US')})`);
+    } else if (nearPoc) {
+      alignedFactors.push(`Anclaje cercano a POC VPVR ($${Math.round(volumeProfile.poc).toLocaleString('en-US')})`);
+    }
+  }
+
+  // Check if an opposing confluence zone sits squarely between Entry and TP1
+  const minPath = Math.min(idea.entry, idea.takeProfit1);
+  const maxPath = Math.max(idea.entry, idea.takeProfit1);
+  const blockerCluster = confluences.find(
+    (z) =>
+      z.factorCount >= 3 &&
+      z.avgPrice > minPath * 1.002 &&
+      z.avgPrice < maxPath * 0.998 &&
+      ((isLong && z.kind === 'resistencia') || (!isLong && z.kind === 'soporte'))
+  );
+  if (blockerCluster) {
+    scoreDelta -= 3;
+    conflictingFactors.push(
+      `Clúster ${blockerCluster.factorCount}× intermedio antes de TP1 ($${Math.round(blockerCluster.avgPrice).toLocaleString('en-US')})`
+    );
+  }
+
+  // 4. Oscillator Divergences (RSI / MACD / CVD)
+  const bullDiv = divergences.find((d) => d.kind.startsWith('bullish'));
+  const bearDiv = divergences.find((d) => d.kind.startsWith('bearish'));
+  if (isLong && bullDiv) {
+    scoreDelta += 4;
+    alignedFactors.push(`${bullDiv.label} confirmada`);
+  } else if (isLong && bearDiv) {
+    scoreDelta -= 4;
+    conflictingFactors.push(`Precaución: ${bearDiv.label} contraria`);
+  } else if (!isLong && bearDiv) {
+    scoreDelta += 4;
+    alignedFactors.push(`${bearDiv.label} confirmada`);
+  } else if (!isLong && bullDiv) {
+    scoreDelta -= 4;
+    conflictingFactors.push(`Precaución: ${bullDiv.label} contraria`);
+  }
+
+  // 5. Live OKX Taker Flow & Passive Absorption
+  if (takerTape) {
+    if (takerTape.absorption.detected) {
+      const alignedAbs =
+        (isLong && takerTape.absorption.side === 'compra') ||
+        (!isLong && takerTape.absorption.side === 'venta');
+      if (alignedAbs) {
+        scoreDelta += 4;
+        alignedFactors.push(`Absorción pasiva de ${takerTape.absorption.side} en cinta`);
+      } else {
+        scoreDelta -= 4;
+        conflictingFactors.push(`Absorción pasiva contraria (${takerTape.absorption.side})`);
+      }
+    } else if (isLong && takerTape.buyRatioPct >= 58) {
+      scoreDelta += 2;
+      alignedFactors.push(`Flujo Taker comprador (${takerTape.buyRatioPct.toFixed(0)}%)`);
+    } else if (!isLong && takerTape.buyRatioPct <= 42) {
+      scoreDelta += 2;
+      alignedFactors.push(`Flujo Taker vendedor (${(100 - takerTape.buyRatioPct).toFixed(0)}%)`);
+    }
+  }
+
+  // 6. News Sentiment & Rolling Correlation Sensitivity (7D / 14D / 30D)
+  let macroSensitivityNote: string | null = null;
+  if (macroRegime) {
+    const { sentimentLabel, sentimentScore, rollingR, windowDays, volPct } = macroRegime;
+    if (
+      (isLong && sentimentLabel === 'Alcista' && sentimentScore >= 15) ||
+      (!isLong && sentimentLabel === 'Bajista' && sentimentScore <= -15)
+    ) {
+      scoreDelta += 2;
+      alignedFactors.push(`Sentimiento noticias ${sentimentLabel} (${sentimentScore >= 0 ? '+' : ''}${sentimentScore})`);
+    } else if (
+      (isLong && sentimentLabel === 'Bajista' && sentimentScore <= -20) ||
+      (!isLong && sentimentLabel === 'Alcista' && sentimentScore >= 20)
+    ) {
+      scoreDelta -= 2;
+      conflictingFactors.push(`Titulares con sesgo opuesto (${sentimentLabel} ${sentimentScore})`);
+    }
+
+    if (rollingR !== null) {
+      const volTxt = volPct !== null ? ` · Vol ${windowDays}d ${volPct.toFixed(2)}%` : '';
+      if (rollingR >= 0.3) {
+        macroSensitivityNote = `Sensibilidad ${windowDays}D alta (r=${rollingR >= 0 ? '+' : ''}${rollingR.toFixed(2)}${volTxt}): noticias/macro amplifican mechas; respetar holgura de SL.`;
+      } else if (rollingR <= -0.25) {
+        macroSensitivityNote = `Correlación inversa ${windowDays}D (r=${rollingR.toFixed(2)}${volTxt}): compresión pese a titulares; prioridad a niveles técnicos.`;
+      } else {
+        macroSensitivityNote = `Desacople técnico ${windowDays}D (r=${rollingR >= 0 ? '+' : ''}${rollingR.toFixed(2)}${volTxt}): prevalece estructura VPVR / liquidez.`;
+      }
+    }
+  }
+
+  return {
+    mtfAlignedCount,
+    mtfTotal: mtfMatrix.length,
+    scoreDelta,
+    alignedFactors,
+    conflictingFactors,
+    confluenceEntryTag,
+    macroSensitivityNote,
+  };
+}
+
 export function generateTradingOptions(input: {
   asset: SymbolAsset;
   timeframe: Timeframe;
@@ -287,6 +547,15 @@ export function generateTradingOptions(input: {
   spreadPct?: number;
   feePctPerSide?: number;
   slippagePctPerSide?: number;
+  volumeProfile?: VolumeProfileData | null;
+  fibAnalysis?: FibonacciAnalysis | null;
+  fvgs?: FairValueGap[];
+  confluences?: ConfluenceZone[];
+  divergences?: OscillatorDivergence[];
+  techSnapshot?: TechnicalSnapshotSummary | null;
+  mtfMatrix?: MultiTimeframeRow[];
+  takerTape?: TakerTapeSummary | null;
+  macroRegime?: MacroRegimeInput | null;
 }): TradeOptionIdea[] {
   const {
     asset,
@@ -301,6 +570,15 @@ export function generateTradingOptions(input: {
     spreadPct = 0.02,
     feePctPerSide = 0.05,
     slippagePctPerSide = 0.02,
+    volumeProfile = null,
+    fibAnalysis = null,
+    fvgs = [],
+    confluences = [],
+    divergences = [],
+    techSnapshot = null,
+    mtfMatrix = [],
+    takerTape = null,
+    macroRegime = null,
   } = input;
 
   if (candles.length < 15 || spot <= 0) return [];
@@ -668,11 +946,211 @@ export function generateTradingOptions(input: {
     });
   }
 
-  if (!scoring) {
-    return ideas;
+  // ------------------------------------------------------------------
+  // 4. Setup: Confluencia Técnica (Golden Pocket Fib / FVG / VPVR / Cluster)
+  // ------------------------------------------------------------------
+  const bestCluster = confluences[0] ?? null;
+  const nearBullFvg = fvgs.find((g) => g.direction === 'bullish' && g.mid <= spot * 1.002);
+  const nearBearFvg = fvgs.find((g) => g.direction === 'bearish' && g.mid >= spot * 0.998);
+
+  const bullVotes =
+    (techSnapshot?.overallBias === 'Alcista' ? 2 : techSnapshot?.overallBias === 'Bajista' ? -2 : 0) +
+    mtfMatrix.reduce((acc, r) => acc + (r.overall === 'Alcista' ? 1 : r.overall === 'Bajista' ? -1 : 0), 0);
+  const confDir: 'LONG' | 'SHORT' =
+    bullVotes > 0
+      ? 'LONG'
+      : bullVotes < 0
+      ? 'SHORT'
+      : bestCluster?.kind === 'resistencia'
+      ? 'SHORT'
+      : 'LONG';
+
+  const hasTechAnchor =
+    Boolean(bestCluster) ||
+    Boolean(fibAnalysis) ||
+    Boolean(volumeProfile) ||
+    Boolean(confDir === 'LONG' ? nearBullFvg : nearBearFvg);
+
+  if (hasTechAnchor) {
+    if (confDir === 'LONG') {
+      const gpMid = fibAnalysis
+        ? (fibAnalysis.goldenPocketLow + fibAnalysis.goldenPocketHigh) * 0.5
+        : null;
+      const supportCluster = confluences.find((z) => z.avgPrice <= spot * 1.002) ?? bestCluster;
+      const rawAnchor =
+        (supportCluster && supportCluster.avgPrice <= spot * 1.003 ? supportCluster.avgPrice : null) ??
+        (nearBullFvg ? nearBullFvg.mid : null) ??
+        (gpMid && gpMid <= spot * 1.004 ? gpMid : null) ??
+        (volumeProfile && volumeProfile.val <= spot ? volumeProfile.val : spot - atr * 0.6);
+
+      const entry = roundPrice(Math.min(spot, rawAnchor), asset);
+      const fibInvalidation = fibAnalysis
+        ? fibAnalysis.levels.find((l) => l.ratio === 0.786 && l.price < entry)?.price
+        : undefined;
+      const stopLoss = roundPrice(
+        Math.min(entry - atr * 1.05, fibInvalidation ? fibInvalidation - atr * 0.25 : entry - atr * 1.2),
+        asset
+      );
+      const riskDist = Math.max(atr * 0.45, entry - stopLoss);
+
+      const pocAbove = volumeProfile && volumeProfile.poc > entry + riskDist * 1.2 ? volumeProfile.poc : null;
+      const vahAbove = volumeProfile && volumeProfile.vah > entry + riskDist * 1.8 ? volumeProfile.vah : null;
+      const tp1Raw = pocAbove ?? aboveLiq.find((l) => l.price >= entry + riskDist * 1.5)?.price ?? entry + riskDist * 2.1;
+      const takeProfit1 = roundPrice(Math.max(entry + riskDist * 1.5, tp1Raw), asset);
+      const tp2Raw =
+        vahAbove && vahAbove > takeProfit1 + riskDist * 0.6
+          ? vahAbove
+          : aboveLiq.find((l) => l.price >= takeProfit1 + riskDist * 0.8)?.price ??
+            Math.max(takeProfit1 + riskDist, entry + riskDist * 3.1);
+      const takeProfit2 = roundPrice(tp2Raw, asset);
+
+      const sz = computePositionSize(capitalUsd, riskPct, entry, stopLoss);
+      const anchorReason = supportCluster
+        ? `Clúster ${supportCluster.factorCount}× (${supportCluster.factors.slice(0, 2).join(' + ')})`
+        : nearBullFvg
+        ? 'FVG alcista sin mitigar'
+        : gpMid
+        ? 'Golden Pocket Fib (61.8%-65%)'
+        : 'Soporte VPVR VAL';
+
+      ideas.push({
+        id: 'setup-tech-confluence-long',
+        title: `Confluencia Técnica Alcista · ${anchorReason}`,
+        category: 'Confluencia Técnica',
+        direction: 'LONG',
+        confidenceScore: Math.min(95, 66 + (supportCluster ? supportCluster.factorCount * 4 : 6) + (nearBullFvg ? 5 : 0)),
+        entry,
+        quantity: sz.quantity,
+        notionalUsd: sz.notionalUsd,
+        riskUsd: sz.riskUsd,
+        takeProfit1,
+        takeProfit2,
+        stopLoss,
+        rr1: (takeProfit1 - entry) / riskDist,
+        rr2: (takeProfit2 - entry) / riskDist,
+        tp1ProbPct: getTouchProb(spot, takeProfit1, cone),
+        tp2ProbPct: getTouchProb(spot, takeProfit2, cone),
+        tp1Reason: pocAbove ? `POC VPVR ($${Math.round(pocAbove).toLocaleString('en-US')})` : 'Resistencia / 2.1R',
+        tp2Reason: vahAbove ? `VAH VPVR ($${Math.round(vahAbove).toLocaleString('en-US')})` : 'Extensión técnica 3.1R',
+        slReason: fibInvalidation ? 'Bajo retroceso Fib 78.6%' : 'Bajo zona técnica + ATR',
+        summary:
+          'Planifica entrada límite sobre confluencia multi-factor de Análisis Técnico (Golden Pocket, FVG sin mitigar o Value Area VPVR).',
+        confluences: [
+          `Ancla técnica: ${anchorReason}`,
+          volumeProfile
+            ? `VPVR VAL $${Math.round(volumeProfile.val).toLocaleString('en-US')} / POC $${Math.round(volumeProfile.poc).toLocaleString('en-US')} / VAH $${Math.round(volumeProfile.vah).toLocaleString('en-US')}`
+            : 'Perfil de volumen institucional',
+          fibAnalysis
+            ? `Golden Pocket Fib: $${Math.round(fibAnalysis.goldenPocketLow).toLocaleString('en-US')}–$${Math.round(fibAnalysis.goldenPocketHigh).toLocaleString('en-US')}`
+            : 'Niveles de retroceso Fibonacci',
+        ],
+      });
+    } else {
+      const gpMid = fibAnalysis
+        ? (fibAnalysis.goldenPocketLow + fibAnalysis.goldenPocketHigh) * 0.5
+        : null;
+      const resCluster = confluences.find((z) => z.avgPrice >= spot * 0.998) ?? bestCluster;
+      const rawAnchor =
+        (resCluster && resCluster.avgPrice >= spot * 0.997 ? resCluster.avgPrice : null) ??
+        (nearBearFvg ? nearBearFvg.mid : null) ??
+        (gpMid && gpMid >= spot * 0.996 ? gpMid : null) ??
+        (volumeProfile && volumeProfile.vah >= spot ? volumeProfile.vah : spot + atr * 0.6);
+
+      const entry = roundPrice(Math.max(spot, rawAnchor), asset);
+      const fibInvalidation = fibAnalysis
+        ? fibAnalysis.levels.find((l) => l.ratio === 0.786 && l.price > entry)?.price
+        : undefined;
+      const stopLoss = roundPrice(
+        Math.max(entry + atr * 1.05, fibInvalidation ? fibInvalidation + atr * 0.25 : entry + atr * 1.2),
+        asset
+      );
+      const riskDist = Math.max(atr * 0.45, stopLoss - entry);
+
+      const pocBelow = volumeProfile && volumeProfile.poc < entry - riskDist * 1.2 ? volumeProfile.poc : null;
+      const valBelow = volumeProfile && volumeProfile.val < entry - riskDist * 1.8 ? volumeProfile.val : null;
+      const tp1Raw = pocBelow ?? belowLiq.find((l) => l.price <= entry - riskDist * 1.5)?.price ?? entry - riskDist * 2.1;
+      const takeProfit1 = roundPrice(Math.min(entry - riskDist * 1.5, tp1Raw), asset);
+      const tp2Raw =
+        valBelow && valBelow < takeProfit1 - riskDist * 0.6
+          ? valBelow
+          : belowLiq.find((l) => l.price <= takeProfit1 - riskDist * 0.8)?.price ??
+            Math.min(takeProfit1 - riskDist, entry - riskDist * 3.1);
+      const takeProfit2 = roundPrice(tp2Raw, asset);
+
+      const sz = computePositionSize(capitalUsd, riskPct, entry, stopLoss);
+      const anchorReason = resCluster
+        ? `Clúster ${resCluster.factorCount}× (${resCluster.factors.slice(0, 2).join(' + ')})`
+        : nearBearFvg
+        ? 'FVG bajista sin mitigar'
+        : gpMid
+        ? 'Golden Pocket Fib (61.8%-65%)'
+        : 'Techo VPVR VAH';
+
+      ideas.push({
+        id: 'setup-tech-confluence-short',
+        title: `Confluencia Técnica Bajista · ${anchorReason}`,
+        category: 'Confluencia Técnica',
+        direction: 'SHORT',
+        confidenceScore: Math.min(95, 66 + (resCluster ? resCluster.factorCount * 4 : 6) + (nearBearFvg ? 5 : 0)),
+        entry,
+        quantity: sz.quantity,
+        notionalUsd: sz.notionalUsd,
+        riskUsd: sz.riskUsd,
+        takeProfit1,
+        takeProfit2,
+        stopLoss,
+        rr1: (entry - takeProfit1) / riskDist,
+        rr2: (entry - takeProfit2) / riskDist,
+        tp1ProbPct: getTouchProb(spot, takeProfit1, cone),
+        tp2ProbPct: getTouchProb(spot, takeProfit2, cone),
+        tp1Reason: pocBelow ? `POC VPVR ($${Math.round(pocBelow).toLocaleString('en-US')})` : 'Soporte / 2.1R',
+        tp2Reason: valBelow ? `VAL VPVR ($${Math.round(valBelow).toLocaleString('en-US')})` : 'Extensión técnica 3.1R',
+        slReason: fibInvalidation ? 'Sobre retroceso Fib 78.6%' : 'Sobre zona técnica + ATR',
+        summary:
+          'Busca rechazo en confluencia de resistencia técnica (Golden Pocket, FVG bajista sin mitigar o techo VAH) hacia nodos inferiores.',
+        confluences: [
+          `Ancla técnica: ${anchorReason}`,
+          volumeProfile
+            ? `VPVR VAL $${Math.round(volumeProfile.val).toLocaleString('en-US')} / POC $${Math.round(volumeProfile.poc).toLocaleString('en-US')} / VAH $${Math.round(volumeProfile.vah).toLocaleString('en-US')}`
+            : 'Perfil de volumen institucional',
+          fibAnalysis
+            ? `Golden Pocket Fib: $${Math.round(fibAnalysis.goldenPocketLow).toLocaleString('en-US')}–$${Math.round(fibAnalysis.goldenPocketHigh).toLocaleString('en-US')}`
+            : 'Niveles de retroceso Fibonacci',
+        ],
+      });
+    }
   }
 
-  const enriched = ideas.map((idea) => {
+  const techCtx: TechnicalEnrichmentContext = {
+    spot,
+    volumeProfile,
+    fibAnalysis,
+    fvgs,
+    confluences,
+    divergences,
+    techSnapshot,
+    mtfMatrix,
+    takerTape,
+    macroRegime,
+  };
+
+  const withTech = ideas.map((idea) => {
+    const technicalAlignment = buildTechnicalAlignmentAssessment(idea, techCtx);
+    const adjustedConf = technicalAlignment
+      ? Math.max(15, Math.min(98, idea.confidenceScore + technicalAlignment.scoreDelta))
+      : idea.confidenceScore;
+    return {
+      ...idea,
+      confidenceScore: adjustedConf,
+      technicalAlignment,
+    };
+  });
+
+  if (!scoring) {
+    return withTech.sort((a, b) => b.confidenceScore - a.confidenceScore);
+  }
+
+  const enriched = withTech.map((idea) => {
     const assessment = buildIdeaScoringAssessment(
       idea,
       scoring,
@@ -687,7 +1165,8 @@ export function generateTradingOptions(input: {
     };
   });
 
-  // Sort by operability first (CANDIDATA > ESPERAR > BLOQUEADA > DESCARTADA), then exact v1.1 score
+  // Sort by operability first (CANDIDATA > ESPERAR > BLOQUEADA > DESCARTADA),
+  // then exact v1.1 score, using technical alignment scoreDelta as tiebreaker.
   const rankOrder: Record<TradeScoringAssessment['verdict'], number> = {
     CANDIDATA: 0,
     ESPERAR: 1,
@@ -699,6 +1178,8 @@ export function generateTradingOptions(input: {
     const ra = rankOrder[a.scoring!.verdict];
     const rb = rankOrder[b.scoring!.verdict];
     if (ra !== rb) return ra - rb;
-    return b.scoring!.v11Score - a.scoring!.v11Score;
+    const scoreDiff = b.scoring!.v11Score - a.scoring!.v11Score;
+    if (Math.abs(scoreDiff) > 0.05) return scoreDiff;
+    return (b.technicalAlignment?.scoreDelta ?? 0) - (a.technicalAlignment?.scoreDelta ?? 0);
   });
 }

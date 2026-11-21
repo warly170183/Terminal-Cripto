@@ -156,10 +156,24 @@ export type TradeScoringAssessment = {
   blockReasons: string[];
 };
 
+export type TradeTechnicalAlignment = {
+  mtfAlignedCount: number;
+  mtfTotal: number;
+  scoreDelta: number;
+  alignedFactors: string[];
+  conflictingFactors: string[];
+  confluenceEntryTag: string | null;
+  macroSensitivityNote: string | null;
+};
+
 export type TradeOptionIdea = {
   id: string;
   title: string;
-  category: 'Tendencia & Flujo' | 'Barrido de Liquidez' | 'Atracción Gamma / Rango';
+  category:
+    | 'Tendencia & Flujo'
+    | 'Barrido de Liquidez'
+    | 'Atracción Gamma / Rango'
+    | 'Confluencia Técnica';
   direction: 'LONG' | 'SHORT';
   confidenceScore: number; // 0..100
   entry: number;
@@ -179,6 +193,7 @@ export type TradeOptionIdea = {
   summary: string;
   confluences: string[];
   scoring?: TradeScoringAssessment;
+  technicalAlignment?: TradeTechnicalAlignment;
 };
 
 export type OptionTradeRow = {

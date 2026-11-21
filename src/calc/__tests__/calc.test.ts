@@ -4,7 +4,7 @@ import { bsDeltaGamma } from '../blackScholes';
 import { calculateExpectedRangeCone, calculateTouchProbability } from '../cone';
 import { calculateHedgeFlowSeries, calculateOnePercentMoveImpact } from '../hedgeFlow';
 import { calculateEMA, calculateVWAP } from '../indicators';
-import { aggregateStrikes, calculateLevels } from '../options';
+import { aggregateStrikes, calculateLevels, calculateVolatilitySmile } from '../options';
 import type { BacktestParams, Candle, OptionRow } from '../../types/market';
 
 describe('Options GEX, Flip & Max Pain calculations', () => {
@@ -93,6 +93,68 @@ describe('Options GEX, Flip & Max Pain calculations', () => {
     expect(levels.maxPain).toBe(60000);
     expect(levels.callWall).toBe(62000);
     expect(levels.putWall).toBe(58000);
+  });
+
+  it('builds Volatility Smile curve by strike with S/R level alignment and wing skew metrics', () => {
+    const spot = 90000;
+    const futureExpTs = Date.now() + 7 * 86_400_000;
+    const expiry = '2026-11-28';
+    const smileStrikes = [
+      { k: 78000, cIv: 0.56, pIv: 0.62 },
+      { k: 81000, cIv: 0.52, pIv: 0.57 },
+      { k: 85000, cIv: 0.48, pIv: 0.51 },
+      { k: 90000, cIv: 0.45, pIv: 0.46 },
+      { k: 95000, cIv: 0.47, pIv: 0.45 },
+      { k: 99000, cIv: 0.5, pIv: 0.48 },
+      { k: 103000, cIv: 0.54, pIv: 0.52 },
+    ];
+    const options: OptionRow[] = smileStrikes.flatMap((row) => [
+      {
+        instId: `BTC-USD-${row.k}-C`,
+        expiry,
+        expTs: futureExpTs,
+        strike: row.k,
+        type: 'C' as const,
+        oi: 100,
+        iv: row.cIv,
+        delta: 0.4,
+        gamma: 0.00003,
+        mult: 0.01,
+      },
+      {
+        instId: `BTC-USD-${row.k}-P`,
+        expiry,
+        expTs: futureExpTs,
+        strike: row.k,
+        type: 'P' as const,
+        oi: 120,
+        iv: row.pIv,
+        delta: -0.4,
+        gamma: 0.00003,
+        mult: 0.01,
+      },
+    ]);
+
+    const smile = calculateVolatilitySmile({
+      options,
+      spot,
+      expiry,
+      srZones: [
+        { id: 's1', price: 85000, kind: 'support', touches: 3 },
+        { id: 'r1', price: 95000, kind: 'resistance', touches: 2 },
+      ],
+      rangePct: 35,
+    });
+
+    expect(smile.points).toHaveLength(7);
+    expect(smile.atmIvPct).toBeCloseTo(45.5, 1);
+    expect(smile.skew10Pct).not.toBeNull();
+    expect(smile.skew10Pct!).toBeGreaterThan(4); // Put wing at 81k (57%) > Call wing at 99k (50%)
+    expect(smile.wingCurvaturePct!).toBeGreaterThan(5); // Smile convexity > 0
+    expect(smile.minIvStrike).toBe(90000);
+    expect(smile.levelAlignments).toHaveLength(2);
+    expect(smile.levelAlignments[0].ivAtLevelPct).toBeCloseTo(51, 1);
+    expect(smile.levelAlignments[1].ivAtLevelPct).toBeCloseTo(47, 1);
   });
 });
 

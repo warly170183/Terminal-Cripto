@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { AlertTriangle, ChevronDown, ChevronUp, Star, Trash2 } from 'lucide-react';
+import { AlertTriangle, Calendar, ChevronDown, ChevronUp, Star, Trash2 } from 'lucide-react';
 import { getAtTheMoneyIV } from '../calc/cone';
 import { analyzeMarketLiquidity } from '../calc/liquidity';
 import {
@@ -10,6 +10,7 @@ import {
 } from '../calc/options';
 import { useTerminalStore } from '../store/terminalStore';
 import type { GexLadderMode, RightPanelTab } from '../store/terminalStore';
+import { NewsSentimentPanel } from './components/NewsSentimentPanel';
 
 function formatCompactUsd(val: number): string {
   const abs = Math.abs(val);
@@ -51,6 +52,8 @@ export function RightOptionsPanel() {
     selectedLevelId,
     setSelectedLevelId,
     removeUserLevel,
+    events,
+    setEventsModalOpen,
   } = useTerminalStore();
 
   const [ladderFilterAll, setLadderFilterAll] = useState(true);
@@ -212,12 +215,12 @@ export function RightOptionsPanel() {
         {/* Top Tabs: Levels | Live | GEX */}
         <div className="flex items-center justify-between px-3 pt-2 pb-2 border-b border-white/[0.08]">
           <div className="flex items-center gap-1 bg-[#0B0E11] p-0.5 rounded-md border border-white/[0.08]">
-            {(['Levels', 'Live', 'GEX'] as RightPanelTab[]).map((tab) => (
+            {(['Levels', 'Live', 'GEX', 'Macro'] as RightPanelTab[]).map((tab) => (
               <button
                 key={tab}
                 type="button"
                 onClick={() => setRightTab(tab)}
-                className={`px-3.5 py-1 text-xs font-semibold rounded transition-colors whitespace-nowrap shrink-0 ${
+                className={`px-2.5 py-1 text-xs font-semibold rounded transition-colors whitespace-nowrap shrink-0 ${
                   rightTab === tab
                     ? 'bg-slate-200 text-slate-950'
                     : 'text-slate-400 hover:text-slate-200'
@@ -769,6 +772,60 @@ export function RightOptionsPanel() {
                   : 'Pendiente'}
               </span>
             </div>
+          </div>
+        )}
+
+        {/* TAB: MACRO & NEWS SENTIMENT */}
+        {rightTab === 'Macro' && (
+          <div className="flex-1 overflow-y-auto p-3 space-y-4">
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-1.5 text-xs font-semibold text-white">
+                  <Calendar className="w-3.5 h-3.5 text-amber-400" />
+                  <span>Eventos Macro (UTC)</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setEventsModalOpen(true)}
+                  className="text-[11px] text-sky-300 hover:text-sky-200"
+                >
+                  Gestionar
+                </button>
+              </div>
+              {events.length === 0 ? (
+                <p className="text-[11px] text-slate-500">Sin eventos configurados.</p>
+              ) : (
+                <div className="divide-y divide-white/[0.06] border border-white/[0.08] rounded-md bg-[#0B0E11]/60">
+                  {events.slice(0, 5).map((ev) => {
+                    const isPast = ev.ts < Date.now();
+                    return (
+                      <div
+                        key={ev.id}
+                        className="flex items-center justify-between px-2.5 py-1.5 text-[11px]"
+                      >
+                        <span
+                          className={`px-1.5 py-0.5 rounded font-bold text-[9.5px] ${
+                            isPast
+                              ? 'bg-slate-700/60 text-slate-300'
+                              : 'bg-[#CA8A04] text-[#090D14]'
+                          }`}
+                        >
+                          {ev.name}
+                        </span>
+                        <span className="font-mono-tabular text-slate-300">
+                          {ev.date} · {ev.timeUtc} UTC
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            <NewsSentimentPanel
+              compact
+              onOpenFullCenter={() => setEventsModalOpen(true)}
+            />
           </div>
         )}
       </div>

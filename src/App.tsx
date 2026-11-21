@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react';
 import { getPreviousDayHighLow } from './calc/indicators';
 import { fetchMacroEvents } from './data/eventsClient';
+import { fetchNewsCorrelationCandles1h, fetchNewsFeed } from './data/newsClient';
 import {
   OkxLiveStream,
   fetchIndexCandles,
@@ -14,6 +15,7 @@ import { ArchitectureWorkspace } from './ui/ArchitectureWorkspace';
 import { BacktestWorkspace } from './ui/BacktestWorkspace';
 import { ChartWorkspace } from './ui/ChartWorkspace';
 import { DrawingToolbar } from './ui/DrawingToolbar';
+import { EffectivenessWorkspace } from './ui/EffectivenessWorkspace';
 import { EventsModal } from './ui/EventsModal';
 import { RightOptionsPanel } from './ui/RightOptionsPanel';
 import { ScoringWorkspace } from './ui/ScoringWorkspace';
@@ -41,6 +43,10 @@ export default function App() {
     setOptionsLoading,
     setOptionsError,
     setEvents,
+    setNewsFeed,
+    setNewsCandles1h,
+    setNewsLoading,
+    setNewsError,
   } = useTerminalStore();
 
   const streamRef = useRef<OkxLiveStream | null>(null);
@@ -50,6 +56,67 @@ export default function App() {
   useEffect(() => {
     void fetchMacroEvents().then(setEvents);
   }, [setEvents]);
+
+  // 1b. Poll live aggregated news sentiment feed every 2m
+  useEffect(() => {
+    let cancelled = false;
+    const ctrl = new AbortController();
+
+    async function loadNews() {
+      setNewsLoading(true);
+      try {
+        const data = await fetchNewsFeed(false, ctrl.signal);
+        if (!cancelled) {
+          setNewsFeed(data.items, data.sources, data.updatedAt);
+        }
+      } catch (err) {
+        if (!cancelled && (err as Error).name !== 'AbortError') {
+          setNewsError(err instanceof Error ? err.message : 'Error cargando noticias');
+        }
+      } finally {
+        if (!cancelled) setNewsLoading(false);
+      }
+    }
+
+    void loadNews();
+    const id = setInterval(() => {
+      void loadNews();
+    }, 120_000);
+
+    return () => {
+      cancelled = true;
+      ctrl.abort();
+      clearInterval(id);
+    };
+  }, [setNewsFeed, setNewsLoading, setNewsError]);
+
+  // 1c. Poll 1H candles for consistent headline-to-price correlation
+  useEffect(() => {
+    let cancelled = false;
+    const ctrl = new AbortController();
+
+    async function loadNewsCandles() {
+      try {
+        const c1h = await fetchNewsCorrelationCandles1h(asset, ctrl.signal);
+        if (!cancelled && c1h.length > 0) {
+          setNewsCandles1h(c1h);
+        }
+      } catch {
+        // ignore transient error
+      }
+    }
+
+    void loadNewsCandles();
+    const id = setInterval(() => {
+      void loadNewsCandles();
+    }, 60_000);
+
+    return () => {
+      cancelled = true;
+      ctrl.abort();
+      clearInterval(id);
+    };
+  }, [asset, setNewsCandles1h]);
 
   // 2. Load initial candles + prev day H/L + ticker + start WebSocket stream when asset or timeframe changes
   useEffect(() => {
@@ -218,6 +285,10 @@ export default function App() {
       ) : activeTab === 'trading_options' ? (
         <main className="flex flex-col flex-1 min-h-0">
           <TradingOptionsWorkspace />
+        </main>
+      ) : activeTab === 'effectiveness' ? (
+        <main className="flex flex-col flex-1 min-h-0">
+          <EffectivenessWorkspace />
         </main>
       ) : activeTab === 'scoring' ? (
         <main className="flex flex-col flex-1 min-h-0">

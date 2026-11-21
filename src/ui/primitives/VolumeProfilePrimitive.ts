@@ -17,6 +17,8 @@ type ScreenBucket = {
   buyFrac: number;
   widthFrac: number;
   isPoc: boolean;
+  isHvn: boolean;
+  isLvn: boolean;
   inValueArea: boolean;
 };
 
@@ -51,8 +53,20 @@ class VolumeProfileRenderer implements IPrimitivePaneRenderer {
       if (this.yVah !== null && this.yVal !== null) {
         const vaTop = Math.min(this.yVah, this.yVal);
         const vaHeight = Math.abs(this.yVal - this.yVah);
-        ctx.fillStyle = 'rgba(56, 189, 248, 0.04)';
+        ctx.fillStyle = 'rgba(56, 189, 248, 0.045)';
         ctx.fillRect(rightEdge - maxBarWidth, vaTop, maxBarWidth, vaHeight);
+
+        // VAH / VAL thin guides across chart
+        ctx.strokeStyle = 'rgba(56, 189, 248, 0.28)';
+        ctx.lineWidth = 1;
+        ctx.setLineDash([2, 4]);
+        for (const yLine of [this.yVah, this.yVal]) {
+          ctx.beginPath();
+          ctx.moveTo(0, yLine);
+          ctx.lineTo(rightEdge, yLine);
+          ctx.stroke();
+        }
+        ctx.setLineDash([]);
       }
 
       for (const b of this.buckets) {
@@ -63,7 +77,7 @@ class VolumeProfileRenderer implements IPrimitivePaneRenderer {
         const sellW = totalW - buyW;
         const xStart = rightEdge - totalW;
 
-        const alpha = b.isPoc ? 0.55 : b.inValueArea ? 0.34 : 0.16;
+        const alpha = b.isPoc ? 0.58 : b.isHvn ? 0.44 : b.inValueArea ? 0.32 : b.isLvn ? 0.1 : 0.16;
 
         if (sellW > 0.5) {
           ctx.fillStyle = `rgba(244, 63, 94, ${alpha})`;
@@ -75,9 +89,17 @@ class VolumeProfileRenderer implements IPrimitivePaneRenderer {
         }
 
         if (b.isPoc) {
-          ctx.strokeStyle = 'rgba(250, 204, 21, 0.85)';
-          ctx.lineWidth = 1;
+          ctx.strokeStyle = 'rgba(250, 204, 21, 0.9)';
+          ctx.lineWidth = 1.2;
           ctx.strokeRect(xStart, y0, totalW, h);
+        } else if (b.isHvn) {
+          ctx.strokeStyle = 'rgba(56, 189, 248, 0.6)';
+          ctx.lineWidth = 0.8;
+          ctx.strokeRect(xStart, y0, totalW, h);
+        } else if (b.isLvn) {
+          // Subtle cyan/slate marker on profile edge indicating a low-volume fast-travel node
+          ctx.fillStyle = 'rgba(148, 163, 184, 0.45)';
+          ctx.fillRect(rightEdge - 3, y0 + h * 0.25, 3, Math.max(1.5, h * 0.5));
         }
       }
 
@@ -86,7 +108,7 @@ class VolumeProfileRenderer implements IPrimitivePaneRenderer {
         ctx.setLineDash([4, 3]);
         ctx.moveTo(0, this.yPoc);
         ctx.lineTo(rightEdge, this.yPoc);
-        ctx.strokeStyle = 'rgba(250, 204, 21, 0.72)';
+        ctx.strokeStyle = 'rgba(250, 204, 21, 0.78)';
         ctx.lineWidth = 1.25;
         ctx.stroke();
         ctx.setLineDash([]);
@@ -167,7 +189,9 @@ export class VolumeProfilePrimitive implements ISeriesPrimitive<Time> {
         yBot,
         buyFrac: Math.min(1, Math.max(0, b.buyVol / total)),
         widthFrac: Math.min(1, b.totalVol / maxBucketVol),
-        isPoc: poc >= b.priceLow && poc <= b.priceHigh,
+        isPoc: b.nodeType === 'poc' || (poc >= b.priceLow && poc <= b.priceHigh),
+        isHvn: b.nodeType === 'hvn',
+        isLvn: b.nodeType === 'lvn',
         inValueArea: b.mid >= val && b.mid <= vah,
       });
     }

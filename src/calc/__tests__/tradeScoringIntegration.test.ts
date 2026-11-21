@@ -5,6 +5,18 @@ import { analyzeMarketLiquidity } from '../liquidity';
 import { evaluateScoringSystem } from '../scoringEngine';
 import { generateTradingOptions } from '../tradeSetups';
 
+import {
+  calculateFibonacciLevels,
+  calculateVolumeDeltaSeries,
+  calculateVolumeProfileBuckets,
+  computeTechnicalSnapshot,
+  detectConfluenceZones,
+  detectFairValueGaps,
+  detectOscillatorDivergences,
+  detectSupportResistanceZones,
+  evaluateMultiTimeframeMatrix,
+} from '../technicalAnalysis';
+
 function buildBullCandles(
   count: number,
   barMs: number,
@@ -32,7 +44,7 @@ function buildBullCandles(
   return out;
 }
 
-describe('Trade Options + Scoring v1.1 Integration', () => {
+describe('Trade Options + Scoring v1.1 + Technical Analysis Integration', () => {
   const now = Date.UTC(2026, 10, 20, 12, 0, 0);
   const c4h = buildBullCandles(120, 4 * 3600_000, 52000, 85, 220, now);
   const c1h = buildBullCandles(280, 3600_000, 56000, 25, 110, now);
@@ -126,6 +138,65 @@ describe('Trade Options + Scoring v1.1 Integration', () => {
       const prevRank = rank[ideas[i - 1].scoring!.verdict];
       const curRank = rank[ideas[i].scoring!.verdict];
       expect(prevRank).toBeLessThanOrEqual(curRank);
+    }
+  });
+
+  it('enriches trading options with Confluencia Técnica setup, MTF alignment, VPVR/Fib zones, and rolling macro sensitivity', () => {
+    const vp = calculateVolumeProfileBuckets(c15m, 36);
+    const sr = detectSupportResistanceZones(c15m, spot);
+    const fvgs = detectFairValueGaps(c15m, spot, 6);
+    const fib = calculateFibonacciLevels(c15m, 120, 'auto', spot, { anchorMode: 'pivots' });
+    const snap = computeTechnicalSnapshot(c15m, vp?.poc ?? null, 12);
+    const divs = detectOscillatorDivergences(
+      c15m,
+      snap.rsi14,
+      snap.macd.hist,
+      calculateVolumeDeltaSeries(c15m)
+    );
+    const mtf = evaluateMultiTimeframeMatrix({ '15m': c15m, '1H': c1h, '4H': c4h });
+    const confluences = detectConfluenceZones({
+      spot,
+      srZones: sr,
+      fibAnalysis: fib,
+      volumeProfile: vp,
+      liquidityLevels: liquidity.levels,
+      prevDayHigh: spot + 600,
+      prevDayLow: spot - 600,
+    });
+
+    const ideas = generateTradingOptions({
+      asset: 'BTC',
+      timeframe: '15m',
+      candles: c15m,
+      spot,
+      optionsLevels: optLevels,
+      cone: null,
+      liquidity,
+      capitalUsd: 10000,
+      riskPct: 0.5,
+      scoring: scoringResult,
+      volumeProfile: vp,
+      fibAnalysis: fib,
+      fvgs,
+      confluences,
+      divergences: divs,
+      techSnapshot: snap,
+      mtfMatrix: mtf,
+      macroRegime: {
+        sentimentLabel: 'Alcista',
+        sentimentScore: 28,
+        rollingR: 0.42,
+        windowDays: 14,
+        volPct: 3.1,
+      },
+    });
+
+    expect(ideas.length).toBe(4);
+    expect(ideas.some((i) => i.category === 'Confluencia Técnica')).toBe(true);
+    for (const idea of ideas) {
+      expect(idea.technicalAlignment).toBeDefined();
+      expect(idea.technicalAlignment!.mtfTotal).toBe(4);
+      expect(idea.technicalAlignment!.macroSensitivityNote).toContain('Sensibilidad 14D alta');
     }
   });
 });

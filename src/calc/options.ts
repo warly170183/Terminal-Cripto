@@ -261,3 +261,268 @@ export function calculateTermStructure(
 
   return result;
 }
+
+export type VolatilitySmilePoint = {
+  strike: number;
+  moneynessPct: number;
+  smileIvPct: number;
+  callIvPct: number | null;
+  putIvPct: number | null;
+  callOi: number;
+  putOi: number;
+};
+
+export type SmileLevelAlignment = {
+  id: string;
+  price: number;
+  kind: 'support' | 'resistance' | 'put_wall' | 'call_wall' | 'poc';
+  label: string;
+  ivAtLevelPct: number | null;
+  distancePct: number;
+  touches?: number;
+};
+
+export type VolatilitySmileData = {
+  expiry: string;
+  daysToExpiry: number | null;
+  spot: number;
+  points: VolatilitySmilePoint[];
+  atmIvPct: number | null;
+  skew10Pct: number | null;
+  wingCurvaturePct: number | null;
+  minIvStrike: number | null;
+  minIvPct: number | null;
+  levelAlignments: SmileLevelAlignment[];
+};
+
+function interpolateSmileIvPct(points: VolatilitySmilePoint[], targetPrice: number): number | null {
+  if (points.length === 0 || targetPrice <= 0) return null;
+  if (targetPrice <= points[0].strike) return points[0].smileIvPct;
+  const last = points[points.length - 1];
+  if (targetPrice >= last.strike) return last.smileIvPct;
+
+  for (let i = 1; i < points.length; i++) {
+    const prev = points[i - 1];
+    const curr = points[i];
+    if (targetPrice <= curr.strike) {
+      const span = curr.strike - prev.strike;
+      const t = span > 0 ? (targetPrice - prev.strike) / span : 0;
+      return prev.smileIvPct + t * (curr.smileIvPct - prev.smileIvPct);
+    }
+  }
+  return last.smileIvPct;
+}
+
+/**
+ * Builds the Implied Volatility Smile curve by Strike for a given expiry (or nearest active expiry)
+ * and aligns technical Support/Resistance zones & option walls onto the curve.
+ */
+export function calculateVolatilitySmile(params: {
+  options: OptionRow[];
+  spot: number;
+  expiry: string;
+  srZones?: { id: string; price: number; kind: 'support' | 'resistance'; touches: number }[];
+  optionsLevels?: Levels | null;
+  pocPrice?: number | null;
+  rangePct?: number | null; // e.g., 20 or 35 (%) around spot; null for full chain
+  nowMs?: number;
+}): VolatilitySmileData {
+  const {
+    options,
+    spot,
+    expiry,
+    srZones = [],
+    optionsLevels = null,
+    pocPrice = null,
+    rangePct = 35,
+    nowMs = Date.now(),
+  } = params;
+
+  const expiries = getAvailableExpiries(options, nowMs);
+  const resolvedExpiry =
+    expiry && expiry !== 'ALL' && options.some((o) => o.expiry === expiry && o.iv > 0 && o.iv < 5)
+      ? expiry
+      : expiries[0]?.expiry ?? '';
+
+  const expMeta = expiries.find((e) => e.expiry === resolvedExpiry) ?? null;
+
+  if (!resolvedExpiry || spot <= 0) {
+    return {
+      expiry: resolvedExpiry,
+      daysToExpiry: expMeta?.daysToExpiry ?? null,
+      spot,
+      points: [],
+      atmIvPct: null,
+      skew10Pct: null,
+      wingCurvaturePct: null,
+      minIvStrike: null,
+      minIvPct: null,
+      levelAlignments: [],
+    };
+  }
+
+  const rows = options.filter(
+    (o) =>
+      o.expiry === resolvedExpiry &&
+      Number.isFinite(o.strike) &&
+      o.strike > 0 &&
+      Number.isFinite(o.iv) &&
+      o.iv > 0.005 &&
+      o.iv < 5
+  );
+
+  const byStrike = new Map<
+    number,
+    { callIvs: number[]; putIvs: number[]; callOi: number; putOi: number }
+  >();
+
+  for (const r of rows) {
+    let bucket = byStrike.get(r.strike);
+    if (!bucket) {
+      bucket = { callIvs: [], putIvs: [], callOi: 0, putOi: 0 };
+      byStrike.set(r.strike, bucket);
+    }
+    const coinOi = Math.max(0, r.oi * r.mult);
+    if (r.type === 'C') {
+      bucket.callIvs.push(r.iv * 100);
+      bucket.callOi += coinOi;
+    } else {
+      bucket.putIvs.push(r.iv * 100);
+      bucket.putOi += coinOi;
+    }
+  }
+
+  const allPoints: VolatilitySmilePoint[] = Array.from(byStrike.entries())
+    .sort((a, b) => a[0] - b[0])
+    .map(([strike, b]) => {
+      const callIvPct =
+        b.callIvs.length > 0 ? b.callIvs.reduce((s, v) => s + v, 0) / b.callIvs.length : null;
+      const putIvPct =
+        b.putIvs.length > 0 ? b.putIvs.reduce((s, v) => s + v, 0) / b.putIvs.length : null;
+
+      let smileIvPct: number;
+      if (strike < spot * 0.995) {
+        smileIvPct = putIvPct ?? callIvPct ?? 0;
+      } else if (strike > spot * 1.005) {
+        smileIvPct = callIvPct ?? putIvPct ?? 0;
+      } else if (callIvPct !== null && putIvPct !== null) {
+        smileIvPct = (callIvPct + putIvPct) * 0.5;
+      } else {
+        smileIvPct = callIvPct ?? putIvPct ?? 0;
+      }
+
+      return {
+        strike,
+        moneynessPct: ((strike - spot) / spot) * 100,
+        smileIvPct,
+        callIvPct,
+        putIvPct,
+        callOi: b.callOi,
+        putOi: b.putOi,
+      };
+    })
+    .filter((p) => p.smileIvPct > 0);
+
+  const visiblePoints =
+    rangePct !== null && rangePct > 0
+      ? allPoints.filter((p) => Math.abs(p.moneynessPct) <= rangePct)
+      : allPoints;
+
+  const points = visiblePoints.length >= 4 ? visiblePoints : allPoints;
+
+  const atmIvPct = interpolateSmileIvPct(allPoints, spot);
+  const putWing = interpolateSmileIvPct(allPoints, spot * 0.9);
+  const callWing = interpolateSmileIvPct(allPoints, spot * 1.1);
+  const skew10Pct = putWing !== null && callWing !== null ? putWing - callWing : null;
+  const wingCurvaturePct =
+    putWing !== null && callWing !== null && atmIvPct !== null
+      ? (putWing + callWing) * 0.5 - atmIvPct
+      : null;
+
+  let minIvStrike: number | null = null;
+  let minIvPct: number | null = null;
+  for (const pt of points) {
+    if (minIvPct === null || pt.smileIvPct < minIvPct) {
+      minIvPct = pt.smileIvPct;
+      minIvStrike = pt.strike;
+    }
+  }
+
+  // Align technical Support / Resistance zones + Key option walls + POC onto strike domain
+  const levelAlignments: SmileLevelAlignment[] = [];
+  let supIdx = 0;
+  let resIdx = 0;
+  const sortedSr = [...srZones].sort((a, b) => Math.abs(a.price - spot) - Math.abs(b.price - spot));
+  for (const z of sortedSr) {
+    if (z.kind === 'support') {
+      supIdx++;
+      levelAlignments.push({
+        id: z.id,
+        price: z.price,
+        kind: 'support',
+        label: `S${supIdx} Soporte`,
+        ivAtLevelPct: interpolateSmileIvPct(allPoints, z.price),
+        distancePct: ((z.price - spot) / spot) * 100,
+        touches: z.touches,
+      });
+    } else {
+      resIdx++;
+      levelAlignments.push({
+        id: z.id,
+        price: z.price,
+        kind: 'resistance',
+        label: `R${resIdx} Resistencia`,
+        ivAtLevelPct: interpolateSmileIvPct(allPoints, z.price),
+        distancePct: ((z.price - spot) / spot) * 100,
+        touches: z.touches,
+      });
+    }
+  }
+
+  if (optionsLevels) {
+    if (optionsLevels.putWall > 0) {
+      levelAlignments.push({
+        id: 'put-wall-align',
+        price: optionsLevels.putWall,
+        kind: 'put_wall',
+        label: 'Put Wall',
+        ivAtLevelPct: interpolateSmileIvPct(allPoints, optionsLevels.putWall),
+        distancePct: ((optionsLevels.putWall - spot) / spot) * 100,
+      });
+    }
+    if (optionsLevels.callWall > 0) {
+      levelAlignments.push({
+        id: 'call-wall-align',
+        price: optionsLevels.callWall,
+        kind: 'call_wall',
+        label: 'Call Wall',
+        ivAtLevelPct: interpolateSmileIvPct(allPoints, optionsLevels.callWall),
+        distancePct: ((optionsLevels.callWall - spot) / spot) * 100,
+      });
+    }
+  }
+
+  if (pocPrice && pocPrice > 0) {
+    levelAlignments.push({
+      id: 'poc-align',
+      price: pocPrice,
+      kind: 'poc',
+      label: 'POC VPVR',
+      ivAtLevelPct: interpolateSmileIvPct(allPoints, pocPrice),
+      distancePct: ((pocPrice - spot) / spot) * 100,
+    });
+  }
+
+  return {
+    expiry: resolvedExpiry,
+    daysToExpiry: expMeta?.daysToExpiry ?? null,
+    spot,
+    points,
+    atmIvPct,
+    skew10Pct,
+    wingCurvaturePct,
+    minIvStrike,
+    minIvPct,
+    levelAlignments,
+  };
+}
