@@ -1,22 +1,30 @@
 import type { Candle } from '../types/market';
 import type {
+  AuxiliaryMarketContext,
   BlockedCondition,
   DirectionEvaluation,
   DirectionParamResult,
   DirectionVerdict,
   FamilySummary,
   FundingStats90D,
+  GapImprovementItem,
+  GapTo80Summary,
+  HistoricalAuditRow,
+  HistoricalAuditSummary,
   MultiTfScoringDataset,
   OpenInterestWindow,
   ParameterPoints,
   ParameterScoreRow,
+  PivotAnchorOption,
   ScoreBandLabel,
   ScoringConfig,
   ScoringFamilyId,
   ScoringParameterId,
   ScoringResult,
   TradeExecutionPlan,
+  TriggerFreshnessInfo,
   VolumeProfile7D,
+  VpLevelLock,
 } from '../types/scoring';
 import { calculateEMA, calculateRSI } from './indicators';
 
@@ -281,7 +289,7 @@ export function calculateSevenDayVolumeProfile(
   };
 }
 
-function calculateAnchoredVWAP(candles: Candle[], anchorIdx: number): number[] {
+export function calculateAnchoredVWAP(candles: Candle[], anchorIdx: number): number[] {
   const out: number[] = new Array(candles.length).fill(0);
   let cumPV = 0;
   let cumV = 0;
@@ -1058,9 +1066,23 @@ export function evaluateScoringSystem(
     short: scoreC1('SHORT'),
   };
 
-  // C2: VWAP anclado al último pivote confirmado de 1h que origina el impulso
+  // C2: VWAP anclado al último pivote confirmado de 1h (o pivote fijado antes del setup)
+  const pivots1hOptions: PivotAnchorOption[] = pivots1h
+    .slice(-8)
+    .reverse()
+    .map((p) => ({ ts: p.ts, price: p.price, type: p.type }));
+
+  const lockedPivot =
+    config.avwapAnchorLockTs != null
+      ? pivots1h.find((p) => p.ts === config.avwapAnchorLockTs) ?? null
+      : null;
+
   const anchorPivot =
-    pivots1h.length > 0 ? pivots1h[pivots1h.length - 1] : null;
+    lockedPivot ?? (pivots1h.length > 0 ? pivots1h[pivots1h.length - 1] : null);
+  const activeAvwapAnchor: PivotAnchorOption | null = anchorPivot
+    ? { ts: anchorPivot.ts, price: anchorPivot.price, type: anchorPivot.type }
+    : null;
+
   const anchoredVwapSeries =
     anchorPivot && candles1h.length > 5
       ? calculateAnchoredVWAP(candles1h, anchorPivot.index)
@@ -1124,23 +1146,35 @@ export function evaluateScoringSystem(
     maxWeight: 4,
     observedSummary:
       avwapNow !== null && anchorPivot
-        ? `$${avwapNow.toFixed(1)} (desde pivote ${anchorPivot.type})`
+        ? `$${avwapNow.toFixed(1)} (${lockedPivot ? 'Fijo' : 'Auto'} ${anchorPivot.type})`
         : 'N/D',
     long: scoreLevelAcceptance('LONG', avwapNow, 'VWAP anclado', 4, anchoredVwapSeries),
     short: scoreLevelAcceptance('SHORT', avwapNow, 'VWAP anclado', 4, anchoredVwapSeries),
   };
 
-  // C3: Perfil de volumen fijo 7 días UTC previos (POC/VAH/VAL)
+  // C3: Perfil de volumen fijo 7 días UTC previos (POC/VAH/VAL con pre-bloqueo opcional)
+  const vpLevelLock: VpLevelLock = config.vpLevelLock ?? 'auto';
   let selectedVpLevel: number | null = null;
   let selectedVpLabel = 'N/D';
   if (vp7d && spot > 0) {
-    const candidates = [
-      { label: 'POC 7d', price: vp7d.poc },
-      { label: 'VAH 7d', price: vp7d.vah },
-      { label: 'VAL 7d', price: vp7d.val },
-    ].sort((a, b) => Math.abs(a.price - spot) - Math.abs(b.price - spot));
-    selectedVpLevel = candidates[0].price;
-    selectedVpLabel = candidates[0].label;
+    if (vpLevelLock === 'POC') {
+      selectedVpLevel = vp7d.poc;
+      selectedVpLabel = 'POC 7d (Fijo)';
+    } else if (vpLevelLock === 'VAH') {
+      selectedVpLevel = vp7d.vah;
+      selectedVpLabel = 'VAH 7d (Fijo)';
+    } else if (vpLevelLock === 'VAL') {
+      selectedVpLevel = vp7d.val;
+      selectedVpLabel = 'VAL 7d (Fijo)';
+    } else {
+      const candidates = [
+        { label: 'POC 7d', price: vp7d.poc },
+        { label: 'VAH 7d', price: vp7d.vah },
+        { label: 'VAL 7d', price: vp7d.val },
+      ].sort((a, b) => Math.abs(a.price - spot) - Math.abs(b.price - spot));
+      selectedVpLevel = candidates[0].price;
+      selectedVpLabel = candidates[0].label;
+    }
   }
 
   const c3Row: ParameterScoreRow = {
@@ -1172,11 +1206,23 @@ export function evaluateScoringSystem(
 
   const evalTriggerD1 = (
     dir: 'LONG' | 'SHORT'
-  ): { param: DirectionParamResult; validationLevel: number } => {
+  ): {
+    param: DirectionParamResult;
+    validationLevel: number;
+    freshness: TriggerFreshnessInfo;
+  } => {
+    const emptyFreshness: TriggerFreshnessInfo = {
+      barsSinceBreakout: null,
+      remainingValidBars: null,
+      timeStopBars: 16,
+      expired: false,
+    };
+
     if (candles15m.length < 15 || atr15 <= 0) {
       return {
         param: makeParamResult(null, 8, true, true, 'Velas 15m insuficientes para disparador.'),
         validationLevel: spot,
+        freshness: emptyFreshness,
       };
     }
     const band = atr15 * 0.1;
@@ -1184,11 +1230,13 @@ export function evaluateScoringSystem(
     const last15 = recent[recent.length - 1];
 
     if (dir === 'LONG') {
-      // Validation level: either breakout level (recentHigh15 if near/broken) or pullback support (recentLow15 / ema20_1h)
       const valLevel =
         last15.c > recentHigh15 - atr15 * 0.8 ? recentHigh15 : Math.max(recentLow15, e20 ?? recentLow15);
 
       const breakoutBarIdx = recent.findIndex((b) => b.c > valLevel + band);
+      const barsSince = breakoutBarIdx !== -1 ? recent.length - 1 - breakoutBarIdx : null;
+      const remainingValidBars = barsSince !== null ? Math.max(0, 4 - barsSince) : null;
+
       if (breakoutBarIdx !== -1 && breakoutBarIdx < recent.length - 1) {
         const afterBreak = recent.slice(breakoutBarIdx + 1);
         const retestedAndHeld = afterBreak.some(
@@ -1204,6 +1252,12 @@ export function evaluateScoringSystem(
               `Ruptura/retroceso 15m + retesteo confirmado en banda ±0.1 ATR ($${valLevel.toFixed(1)}).`
             ),
             validationLevel: valLevel,
+            freshness: {
+              barsSinceBreakout: barsSince,
+              remainingValidBars,
+              timeStopBars: 16,
+              expired: barsSince !== null && barsSince >= 4,
+            },
           };
         }
       }
@@ -1217,6 +1271,12 @@ export function evaluateScoringSystem(
             `Cierre 15m favorable sobre nivel de validación ($${valLevel.toFixed(1)}) sin retesteo.`
           ),
           validationLevel: valLevel,
+          freshness: {
+            barsSinceBreakout: barsSince ?? 0,
+            remainingValidBars: remainingValidBars ?? 4,
+            timeStopBars: 16,
+            expired: false,
+          },
         };
       }
       if (last15.c > valLevel - band * 2 && last15.c > last15.o) {
@@ -1229,23 +1289,29 @@ export function evaluateScoringSystem(
             `Patrón alcista 15m en desarrollo junto a $${valLevel.toFixed(1)} (sin cierre > +0.1 ATR).`
           ),
           validationLevel: valLevel,
+          freshness: emptyFreshness,
         };
       }
       if (last15.l <= valLevel + band && last15.c > last15.l + (last15.h - last15.l) * 0.5) {
         return {
           param: makeParamResult(25, 8, true, false, `Mecha de rechazo inicial 15m, sin confirmación de cierre.`),
           validationLevel: valLevel,
+          freshness: emptyFreshness,
         };
       }
       return {
         param: makeParamResult(0, 8, true, false, `Sin disparador 15m confirmado sobre $${valLevel.toFixed(1)}.`),
         validationLevel: valLevel,
+        freshness: emptyFreshness,
       };
     } else {
       const valLevel =
         last15.c < recentLow15 + atr15 * 0.8 ? recentLow15 : Math.min(recentHigh15, e20 ?? recentHigh15);
 
       const breakoutBarIdx = recent.findIndex((b) => b.c < valLevel - band);
+      const barsSince = breakoutBarIdx !== -1 ? recent.length - 1 - breakoutBarIdx : null;
+      const remainingValidBars = barsSince !== null ? Math.max(0, 4 - barsSince) : null;
+
       if (breakoutBarIdx !== -1 && breakoutBarIdx < recent.length - 1) {
         const afterBreak = recent.slice(breakoutBarIdx + 1);
         const retestedAndHeld = afterBreak.some(
@@ -1261,6 +1327,12 @@ export function evaluateScoringSystem(
               `Ruptura/rebote 15m + retesteo bajista confirmado en $${valLevel.toFixed(1)}.`
             ),
             validationLevel: valLevel,
+            freshness: {
+              barsSinceBreakout: barsSince,
+              remainingValidBars,
+              timeStopBars: 16,
+              expired: barsSince !== null && barsSince >= 4,
+            },
           };
         }
       }
@@ -1274,6 +1346,12 @@ export function evaluateScoringSystem(
             `Cierre 15m bajista confirmado bajo $${valLevel.toFixed(1)} sin retesteo.`
           ),
           validationLevel: valLevel,
+          freshness: {
+            barsSinceBreakout: barsSince ?? 0,
+            remainingValidBars: remainingValidBars ?? 4,
+            timeStopBars: 16,
+            expired: false,
+          },
         };
       }
       if (last15.c < valLevel + band * 2 && last15.c < last15.o) {
@@ -1286,17 +1364,20 @@ export function evaluateScoringSystem(
             `Patrón bajista 15m incompleto junto a $${valLevel.toFixed(1)}.`
           ),
           validationLevel: valLevel,
+          freshness: emptyFreshness,
         };
       }
       if (last15.h >= valLevel - band && last15.c < last15.h - (last15.h - last15.l) * 0.5) {
         return {
           param: makeParamResult(25, 8, true, false, `Rechazo inicial bajista 15m, aún sin cierre válido.`),
           validationLevel: valLevel,
+          freshness: emptyFreshness,
         };
       }
       return {
         param: makeParamResult(0, 8, true, false, `Sin disparador bajista 15m confirmado bajo $${valLevel.toFixed(1)}.`),
         validationLevel: valLevel,
+        freshness: emptyFreshness,
       };
     }
   };
@@ -1570,6 +1651,8 @@ export function evaluateScoringSystem(
   const riskBudgetUsd = Math.max(1, config.capitalUsd * (Math.max(0.05, config.riskPct) / 100));
   const spreadPct = orderbook?.spreadPct ?? 0.02;
 
+  const leverage = Math.max(1, config.leverage ?? 5);
+
   function buildExecutionPlan(dir: 'LONG' | 'SHORT'): TradeExecutionPlan | null {
     if (spot <= 0 || atr15 <= 0 || atr1h <= 0) return null;
     const entry = dir === 'LONG' ? entryLong : entryShort;
@@ -1602,7 +1685,6 @@ export function evaluateScoringSystem(
     const stopDist = Math.abs(entry - stopLoss);
     if (stopDist <= 0) return null;
 
-    // First technically justified objective (nearest structural H/L/VP target with realistic room, never fabricated)
     let tpRaw: number;
     if (dir === 'LONG') {
       const structuralTargets = [...resistLevels, struct4h?.lastPivotHigh ?? 0].filter(
@@ -1625,12 +1707,24 @@ export function evaluateScoringSystem(
     const takeProfit = roundToStep(tpRaw, priceDecimals);
     const targetDist = Math.abs(takeProfit - entry);
 
+    // Dynamic or manual funding cost for 4h (16 x 15m) hold in perpetual mode
+    let effectiveFundingCostPct = 0;
+    if (derivApplicable) {
+      if (config.autoFundingFromLive && dataset.fundingCurrent8h !== null) {
+        const ratePct8h = dataset.fundingCurrent8h * 100;
+        const paidPct = dir === 'LONG' ? Math.max(0, ratePct8h) : Math.max(0, -ratePct8h);
+        effectiveFundingCostPct = Number((paidPct * 0.5).toFixed(4));
+      } else {
+        effectiveFundingCostPct = config.expectedFundingCostPct;
+      }
+    }
+
     // Linear contract sizing (§9): L = q * |E - S| + C_stop <= riskBudgetUsd
     const perUnitCostRate =
       (config.feePctPerSide * 2 +
         config.slippagePctPerSide * 2 +
         spreadPct +
-        (derivApplicable ? config.expectedFundingCostPct : 0)) /
+        effectiveFundingCostPct) /
       100;
     const costPerUnitStop = (entry + stopLoss) * 0.5 * perUnitCostRate;
     const costPerUnitTarget = (entry + takeProfit) * 0.5 * perUnitCostRate;
@@ -1639,6 +1733,18 @@ export function evaluateScoringSystem(
     const lotDecimals = asset === 'BTC' ? 4 : 3;
     const quantity = Math.max(0, roundToStep(rawQ, lotDecimals));
     if (quantity <= 0) return null;
+
+    const notionalUsd = quantity * entry;
+    const requiredMarginUsd = derivApplicable ? notionalUsd / leverage : notionalUsd;
+    const estimatedLiqPrice =
+      derivApplicable && leverage > 1
+        ? roundToStep(
+            dir === 'LONG'
+              ? entry * (1 - 1 / leverage + 0.005)
+              : entry * (1 + 1 / leverage - 0.005),
+            priceDecimals
+          )
+        : null;
 
     const grossRiskUsd = quantity * stopDist;
     const grossRewardUsd = quantity * targetDist;
@@ -1658,7 +1764,10 @@ export function evaluateScoringSystem(
       validationLevel: valLevel,
       invalidationMarginAtr: Math.max(0, invMarginAtr),
       quantity,
-      notionalUsd: quantity * entry,
+      notionalUsd,
+      requiredMarginUsd,
+      estimatedLiqPrice,
+      effectiveFundingCostPct,
       grossRiskUsd,
       grossRewardUsd,
       stopCostUsd,
@@ -1822,16 +1931,179 @@ export function evaluateScoringSystem(
   const longStats = computeRawStats('LONG');
   const shortStats = computeRawStats('SHORT');
 
+  // -------------------------------------------------------------------------
+  // Auxiliary Context (§12, strictly 0 points)
+  // -------------------------------------------------------------------------
+  let bbBandwidthPct: number | null = null;
+  let bbSqueezePercentile: number | null = null;
+  let bbStateLabel = 'N/D';
+  if (closes1h.length >= 40) {
+    const bwSeries: number[] = [];
+    for (let idx = 19; idx < closes1h.length; idx++) {
+      const slice = closes1h.slice(idx - 19, idx + 1);
+      const mean = slice.reduce((a, b) => a + b, 0) / 20;
+      const variance = slice.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / 20;
+      const std = Math.sqrt(variance);
+      if (mean > 0) {
+        bwSeries.push(((4 * std) / mean) * 100);
+      }
+    }
+    if (bwSeries.length >= 20) {
+      const curBw = bwSeries[bwSeries.length - 1];
+      const lookback = bwSeries.slice(-100);
+      const le = lookback.filter((b) => b <= curBw).length;
+      const pct = (100 * le) / lookback.length;
+      bbBandwidthPct = curBw;
+      bbSqueezePercentile = pct;
+      bbStateLabel =
+        pct <= 20 ? 'Compresión (Squeeze)' : pct >= 80 ? 'Expansión alta' : 'Normal';
+    }
+  }
+
+  // RSI(14) 1H divergence across last 2 confirmed pivots
+  let rsiDivergence: AuxiliaryMarketContext['rsiDivergence'] = 'Ninguna';
+  const pivLow1h = pivots1h.filter((p) => p.type === 'L');
+  const pivHigh1h = pivots1h.filter((p) => p.type === 'H');
+  if (pivLow1h.length >= 2) {
+    const p1 = pivLow1h[pivLow1h.length - 2];
+    const p2 = pivLow1h[pivLow1h.length - 1];
+    const r1 = rsi1h[p1.index];
+    const r2 = rsi1h[p2.index];
+    if (r1 !== null && r2 !== null && p2.price < p1.price && r2 > r1 + 1.5) {
+      rsiDivergence = 'Alcista';
+    }
+  }
+  if (rsiDivergence === 'Ninguna' && pivHigh1h.length >= 2) {
+    const p1 = pivHigh1h[pivHigh1h.length - 2];
+    const p2 = pivHigh1h[pivHigh1h.length - 1];
+    const r1 = rsi1h[p1.index];
+    const r2 = rsi1h[p2.index];
+    if (r1 !== null && r2 !== null && p2.price > p1.price && r2 < r1 - 1.5) {
+      rsiDivergence = 'Bajista';
+    }
+  }
+
+  const bidWalls = (orderbook?.walls ?? [])
+    .filter((w) => w.side === 'bid' && w.price <= spot)
+    .sort((a, b) => b.price - a.price);
+  const askWalls = (orderbook?.walls ?? [])
+    .filter((w) => w.side === 'ask' && w.price >= spot)
+    .sort((a, b) => a.price - b.price);
+
+  const macroWindowHours = config.macroEventWindowHours ?? 2;
+  let nextMacroEvent: AuxiliaryMarketContext['nextMacroEvent'] = null;
+  if (config.upcomingEvents && config.upcomingEvents.length > 0) {
+    const refNow = dataset.fetchedAt;
+    const futureOrActive = config.upcomingEvents
+      .map((ev) => ({
+        name: ev.name,
+        impact: 'high',
+        hoursAway: (ev.ts - refNow) / 3_600_000,
+      }))
+      .filter((ev) => ev.hoursAway >= -0.5)
+      .sort((a, b) => a.hoursAway - b.hoursAway);
+    if (futureOrActive[0]) {
+      nextMacroEvent = futureOrActive[0];
+    }
+  }
+
+  const auxiliary: AuxiliaryMarketContext = {
+    bbBandwidthPct,
+    bbSqueezePercentile,
+    bbStateLabel,
+    rsiDivergence,
+    nearestBidWall: bidWalls[0]
+      ? { price: bidWalls[0].price, notionalUsd: bidWalls[0].notionalUsd }
+      : null,
+    nearestAskWall: askWalls[0]
+      ? { price: askWalls[0].price, notionalUsd: askWalls[0].notionalUsd }
+      : null,
+    bookImbalancePct: orderbook ? orderbook.imbalancePct : null,
+    nextMacroEvent,
+    swapLiveOiCcy: dataset.swapLiveOi?.oiCcy ?? null,
+    swapLiveOiUsd: dataset.swapLiveOi?.oiUsd ?? null,
+  };
+
+  function buildGapTo80(
+    dir: 'LONG' | 'SHORT',
+    own: ReturnType<typeof computeRawStats>,
+    blocks: BlockedCondition[]
+  ): GapTo80Summary {
+    const pointsNeeded = Math.max(0, 80 - own.score);
+    const denom = Math.max(1, own.availableWeight);
+    const items: GapImprovementItem[] = [];
+
+    for (const row of parameters) {
+      const res = dir === 'LONG' ? row.long : row.short;
+      if (!res.applicable || res.missing || res.points === null) continue;
+      if (res.points >= 75) continue;
+      const gainTo75 = (row.maxWeight * (75 - res.points)) / denom;
+      const gainTo100 = (row.maxWeight * (100 - res.points)) / denom;
+      items.push({
+        id: row.id,
+        name: row.name,
+        currentPts: res.points,
+        targetPts: res.points < 75 ? 75 : 100,
+        gainTo75,
+        gainTo100,
+      });
+    }
+
+    items.sort((a, b) => b.gainTo100 - a.gainTo100);
+    const topImprovements = items.slice(0, 3);
+    const gateBlockers = blocks.map((b) => b.label);
+
+    let summaryText: string;
+    if (pointsNeeded <= 0 && blocks.length === 0) {
+      summaryText = `Cumple corte ≥ 80 (${own.score.toFixed(1)} pts) y todas las puertas de activación.`;
+    } else if (pointsNeeded <= 0 && blocks.length > 0) {
+      summaryText = `Nota ≥ 80 (${own.score.toFixed(1)}), retenida por: ${blocks[0].label}.`;
+    } else if (topImprovements.length > 0) {
+      const top = topImprovements[0];
+      summaryText = `Faltan +${pointsNeeded.toFixed(1)} pts para 80. Mayor palanca: ${top.id} (${top.currentPts}→100 aporta +${top.gainTo100.toFixed(1)} pts).`;
+    } else {
+      summaryText = `Faltan +${pointsNeeded.toFixed(1)} pts para alcanzar el corte de 80.`;
+    }
+
+    return {
+      pointsNeeded,
+      topImprovements,
+      gateBlockers,
+      summaryText,
+    };
+  }
+
   function finalizeDirection(
     dir: 'LONG' | 'SHORT',
     own: ReturnType<typeof computeRawStats>,
     oppScore: number,
-    plan: TradeExecutionPlan | null
+    plan: TradeExecutionPlan | null,
+    triggerFreshness: TriggerFreshnessInfo
   ): DirectionEvaluation {
     const a1Res = dir === 'LONG' ? a1Row.long : a1Row.short;
     const d1Res = dir === 'LONG' ? d1Row.long : d1Row.short;
     const diffVsOpposite = own.score - oppScore;
     const blocks: BlockedCondition[] = [];
+
+    if (!config.isReplay) {
+      const stale15m =
+        lastClosed15mTs === null || dataset.fetchedAt - lastClosed15mTs > 35 * 60_000;
+      if (stale15m) {
+        const minsAgo =
+          lastClosed15mTs !== null
+            ? Math.round((dataset.fetchedAt - lastClosed15mTs) / 60_000)
+            : 0;
+        blocks.push({
+          code: 'DATOS_DESACTUALIZADOS',
+          label: 'Datos críticos desactualizados',
+          detail:
+            lastClosed15mTs === null
+              ? 'Sin velas cerradas de 15m.'
+              : `Última vela 15m tiene ${minsAgo} min de antigüedad (> 35 min).`,
+          severity: 'BLOQUEAR',
+        });
+      }
+    }
 
     if (own.coveragePct < 90) {
       blocks.push({
@@ -1873,6 +2145,41 @@ export function evaluateScoringSystem(
           severity: 'BLOQUEAR',
         });
       }
+      if (plan.requiredMarginUsd > config.capitalUsd) {
+        blocks.push({
+          code: 'MARGEN_INSUFICIENTE',
+          label: 'Margen requerido supera el capital',
+          detail: `Margen necesario $${plan.requiredMarginUsd.toFixed(0)} > capital $${config.capitalUsd.toFixed(0)} (${leverage}x).`,
+          severity: 'BLOQUEAR',
+        });
+      }
+      if (
+        plan.estimatedLiqPrice !== null &&
+        (dir === 'LONG'
+          ? plan.estimatedLiqPrice >= plan.stopLoss
+          : plan.estimatedLiqPrice <= plan.stopLoss)
+      ) {
+        blocks.push({
+          code: 'LIQUIDACION_STOP',
+          label: 'Liquidación antes del Stop estructural',
+          detail: `Liq. estimada $${plan.estimatedLiqPrice.toFixed(priceDecimals)} intercepta antes que Stop $${plan.stopLoss.toFixed(priceDecimals)} a ${leverage}x.`,
+          severity: 'BLOQUEAR',
+        });
+      }
+    }
+
+    if (
+      nextMacroEvent &&
+      nextMacroEvent.impact === 'high' &&
+      macroWindowHours > 0 &&
+      nextMacroEvent.hoursAway <= macroWindowHours
+    ) {
+      blocks.push({
+        code: 'EVENTO_MACRO',
+        label: `Evento macro próximo (${nextMacroEvent.name})`,
+        detail: `Faltan ${Math.max(0, nextMacroEvent.hoursAway).toFixed(1)}h (ventana de bloqueo ≤ ${macroWindowHours}h).`,
+        severity: 'BLOQUEAR',
+      });
     }
 
     if (config.dailyLossReached) {
@@ -1954,11 +2261,25 @@ export function evaluateScoringSystem(
       missingCount: own.missingCount,
       plan,
       blocks,
+      gapTo80: buildGapTo80(dir, own, blocks),
+      triggerFreshness,
     };
   }
 
-  const longEval = finalizeDirection('LONG', longStats, shortStats.score, longPlan);
-  const shortEval = finalizeDirection('SHORT', shortStats, longStats.score, shortPlan);
+  const longEval = finalizeDirection(
+    'LONG',
+    longStats,
+    shortStats.score,
+    longPlan,
+    d1LongRes.freshness
+  );
+  const shortEval = finalizeDirection(
+    'SHORT',
+    shortStats,
+    longStats.score,
+    shortPlan,
+    d1ShortRes.freshness
+  );
 
   const FAMILY_META: { id: ScoringFamilyId; name: string; maxWeight: number }[] = [
     { id: 'A', name: 'Contexto y Estructura', maxWeight: 30 },
@@ -2021,7 +2342,8 @@ export function evaluateScoringSystem(
     asset,
     instId,
     mode: config.mode,
-    evaluatedAt: Date.now(),
+    evaluatedAt: dataset.fetchedAt,
+    isReplay: Boolean(config.isReplay),
     lastClosed4hTs,
     lastClosed1hTs,
     lastClosed15mTs,
@@ -2032,12 +2354,173 @@ export function evaluateScoringSystem(
     fundingStats90d,
     oiWindow,
     regimeLabel,
+    pivots1h: pivots1hOptions,
+    activeAvwapAnchor,
+    activeVpSelection: {
+      lock: vpLevelLock,
+      usedLabel: selectedVpLabel,
+      levelPrice: selectedVpLevel,
+    },
+    auxiliary,
     parameters,
     families,
     longEval,
     shortEval,
     dominantDirection,
     excludedNotes,
+  };
+}
+
+/**
+ * Slices a MultiTfScoringDataset strictly at causal bar close timestamp `asOfTs`
+ * (zero future lookahead) so the v1.1 engine can replay historical closed bars.
+ */
+export function sliceDatasetAsOf(
+  dataset: MultiTfScoringDataset,
+  asOfTs: number
+): MultiTfScoringDataset {
+  const BAR_4H = 4 * 3_600_000;
+  const BAR_1H = 3_600_000;
+  const BAR_15M = 15 * 60_000;
+
+  return {
+    ...dataset,
+    candles4h: dataset.candles4h.filter((c) => c.t + BAR_4H <= asOfTs),
+    candles1h: dataset.candles1h.filter((c) => c.t + BAR_1H <= asOfTs),
+    candles15m: dataset.candles15m.filter((c) => c.t + BAR_15M <= asOfTs),
+    btcCandles4h: dataset.btcCandles4h.filter((c) => c.t + BAR_4H <= asOfTs),
+    oiSeries1h: dataset.oiSeries1h.filter((pt) => pt.ts + BAR_1H <= asOfTs),
+    orderbook: null,
+    swapLiveOi: null,
+    fetchedAt: asOfTs,
+  };
+}
+
+/**
+ * Fase 1 & 2 Causal Historical Audit: evaluates up to `stepCount` past closed 15m/1h
+ * snapshots strictly without lookahead and grades the next 16×15m bars (4h time stop).
+ */
+export function evaluateHistoricalAudit(
+  dataset: MultiTfScoringDataset,
+  config: ScoringConfig,
+  stepCount = 20
+): HistoricalAuditSummary {
+  const bars = dataset.candles15m;
+  if (bars.length < 40) {
+    return {
+      rows: [],
+      evaluatedBars: 0,
+      candidataCount: 0,
+      candidataWinRatePct: 0,
+      candidataExpectancyR: 0,
+      controlExpectancyR: 0,
+    };
+  }
+
+  // Step every 4 closed 15m bars (1h spacing) backward from (end - 16 bars) so every sample has a full 16-bar forward horizon
+  const BAR_15M = 15 * 60_000;
+  const endIdx = bars.length - 17;
+  const minIdx = Math.max(20, endIdx - stepCount * 4);
+  const rows: HistoricalAuditRow[] = [];
+
+  for (let idx = endIdx; idx >= minIdx && rows.length < stepCount; idx -= 4) {
+    const decisionCandle = bars[idx];
+    const asOfTs = decisionCandle.t + BAR_15M;
+    const sliced = sliceDatasetAsOf(dataset, asOfTs);
+    if (sliced.candles15m.length < 21 || sliced.candles1h.length < 50) continue;
+
+    const evalRes = evaluateScoringSystem(sliced, {
+      ...config,
+      isReplay: true,
+      avwapAnchorLockTs: null,
+    });
+    const dom =
+      evalRes.shortEval.score > evalRes.longEval.score ? evalRes.shortEval : evalRes.longEval;
+    const opp =
+      evalRes.shortEval.score > evalRes.longEval.score ? evalRes.longEval : evalRes.shortEval;
+
+    let forwardOutcome: HistoricalAuditRow['forwardOutcome'] = 'PENDIENTE';
+    let forwardR: number | null = null;
+    let maeR: number | null = null;
+    let mfeR: number | null = null;
+
+    const plan = dom.plan;
+    const futureBars = bars.slice(idx + 1, idx + 17);
+    if (plan && futureBars.length > 0) {
+      const isLong = dom.direction === 'LONG';
+      const riskPerUnit = Math.abs(plan.entry - plan.stopLoss);
+      const costPerUnit =
+        plan.quantity > 0 ? plan.stopCostUsd / plan.quantity : riskPerUnit * 0.05;
+      const denomR = riskPerUnit + costPerUnit;
+
+      let hit: 'TP1' | 'STOP' | null = null;
+      let exitPx = futureBars[futureBars.length - 1].c;
+      let worstAdverse = 0;
+      let bestFav = 0;
+
+      for (const fb of futureBars) {
+        const fav = isLong ? fb.h - plan.entry : plan.entry - fb.l;
+        const adv = isLong ? plan.entry - fb.l : fb.h - plan.entry;
+        if (fav > bestFav) bestFav = fav;
+        if (adv > worstAdverse) worstAdverse = adv;
+
+        const stopHit = isLong ? fb.l <= plan.stopLoss : fb.h >= plan.stopLoss;
+        const tpHit = isLong ? fb.h >= plan.takeProfit : fb.l <= plan.takeProfit;
+        // Conservative tie-break if both hit in same candle: STOP first
+        if (stopHit) {
+          hit = 'STOP';
+          exitPx = plan.stopLoss;
+          break;
+        }
+        if (tpHit) {
+          hit = 'TP1';
+          exitPx = plan.takeProfit;
+          break;
+        }
+      }
+
+      forwardOutcome = hit ?? (futureBars.length >= 16 ? 'TEMPORAL_16V' : 'PENDIENTE');
+      const grossMove = isLong ? exitPx - plan.entry : plan.entry - exitPx;
+      forwardR = denomR > 0 ? Number(((grossMove - costPerUnit) / denomR).toFixed(2)) : 0;
+      maeR = denomR > 0 ? Number((worstAdverse / denomR).toFixed(2)) : 0;
+      mfeR = denomR > 0 ? Number((bestFav / denomR).toFixed(2)) : 0;
+    }
+
+    rows.push({
+      ts: asOfTs,
+      spot: evalRes.spot,
+      dominant: dom.direction,
+      score: Number(dom.score.toFixed(1)),
+      oppScore: Number(opp.score.toFixed(1)),
+      verdict: dom.verdict,
+      operable: dom.operable,
+      netRR: plan ? Number(plan.netRR.toFixed(2)) : null,
+      forwardOutcome,
+      forwardR,
+      maeR,
+      mfeR,
+    });
+  }
+
+  const candClosed = rows.filter((r) => r.operable && r.forwardR !== null);
+  const ctrlClosed = rows.filter((r) => !r.operable && r.forwardR !== null);
+
+  return {
+    rows,
+    evaluatedBars: rows.length,
+    candidataCount: rows.filter((r) => r.operable).length,
+    candidataWinRatePct:
+      candClosed.length > 0
+        ? (100 * candClosed.filter((r) => (r.forwardR ?? 0) > 0).length) / candClosed.length
+        : 0,
+    candidataExpectancyR:
+      candClosed.length > 0
+        ? candClosed.reduce((s, r) => s + (r.forwardR ?? 0), 0) / candClosed.length
+        : 0,
+    controlExpectancyR:
+      ctrlClosed.length > 0
+        ? ctrlClosed.reduce((s, r) => s + (r.forwardR ?? 0), 0) / ctrlClosed.length
+        : 0,
   };
 }
 

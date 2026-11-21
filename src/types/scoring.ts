@@ -1,6 +1,8 @@
-import type { Candle, OrderbookDepthData, SymbolAsset } from './market';
+import type { Candle, MacroEvent, OrderbookDepthData, SymbolAsset } from './market';
 
 export type ScoringMode = 'perpetual' | 'spot';
+
+export type VpLevelLock = 'auto' | 'POC' | 'VAH' | 'VAL';
 
 export type ScoringParameterId =
   | 'A1'
@@ -88,6 +90,9 @@ export type TradeExecutionPlan = {
   invalidationMarginAtr: number;
   quantity: number;
   notionalUsd: number;
+  requiredMarginUsd: number;
+  estimatedLiqPrice: number | null;
+  effectiveFundingCostPct: number;
   grossRiskUsd: number;
   grossRewardUsd: number;
   stopCostUsd: number;
@@ -98,6 +103,29 @@ export type TradeExecutionPlan = {
   costToRiskPct: number;
   spreadPct: number;
   depthAtEntryUsd: number;
+};
+
+export type GapImprovementItem = {
+  id: ScoringParameterId;
+  name: string;
+  currentPts: number;
+  targetPts: 75 | 100;
+  gainTo75: number;
+  gainTo100: number;
+};
+
+export type GapTo80Summary = {
+  pointsNeeded: number;
+  topImprovements: GapImprovementItem[];
+  gateBlockers: string[];
+  summaryText: string;
+};
+
+export type TriggerFreshnessInfo = {
+  barsSinceBreakout: number | null;
+  remainingValidBars: number | null;
+  timeStopBars: number;
+  expired: boolean;
 };
 
 export type DirectionEvaluation = {
@@ -117,6 +145,8 @@ export type DirectionEvaluation = {
   missingCount: number;
   plan: TradeExecutionPlan | null;
   blocks: BlockedCondition[];
+  gapTo80: GapTo80Summary;
+  triggerFreshness: TriggerFreshnessInfo;
 };
 
 export type VolumeProfile7D = {
@@ -143,6 +173,25 @@ export type OpenInterestWindow = {
   ts: number;
 };
 
+export type PivotAnchorOption = {
+  ts: number;
+  price: number;
+  type: 'H' | 'L';
+};
+
+export type AuxiliaryMarketContext = {
+  bbBandwidthPct: number | null;
+  bbSqueezePercentile: number | null;
+  bbStateLabel: string;
+  rsiDivergence: 'Alcista' | 'Bajista' | 'Ninguna';
+  nearestBidWall: { price: number; notionalUsd: number } | null;
+  nearestAskWall: { price: number; notionalUsd: number } | null;
+  bookImbalancePct: number | null;
+  nextMacroEvent: { name: string; hoursAway: number; impact: string } | null;
+  swapLiveOiCcy: number | null;
+  swapLiveOiUsd: number | null;
+};
+
 export type ScoringConfig = {
   mode: ScoringMode;
   capitalUsd: number;
@@ -150,8 +199,31 @@ export type ScoringConfig = {
   feePctPerSide: number;
   slippagePctPerSide: number;
   expectedFundingCostPct: number;
+  autoFundingFromLive?: boolean;
+  leverage?: number;
   dailyLossReached: boolean;
   correlatedRiskExceeded: boolean;
+  vpLevelLock?: VpLevelLock;
+  avwapAnchorLockTs?: number | null;
+  macroEventWindowHours?: number;
+  upcomingEvents?: MacroEvent[];
+  isReplay?: boolean;
+};
+
+export type PersistedScoringConfig = {
+  mode: ScoringMode;
+  capitalUsd: number;
+  riskPct: number;
+  feePctPerSide: number;
+  slippagePctPerSide: number;
+  expectedFundingCostPct: number;
+  autoFundingFromLive: boolean;
+  leverage: number;
+  dailyLossReached: boolean;
+  correlatedRiskExceeded: boolean;
+  vpLevelLock: VpLevelLock;
+  avwapAnchorLockTs: number | null;
+  macroEventWindowHours: number;
 };
 
 export type MultiTfScoringDataset = {
@@ -163,6 +235,7 @@ export type MultiTfScoringDataset = {
   btcCandles4h: Candle[];
   orderbook: OrderbookDepthData | null;
   oiSeries1h: { ts: number; oiUsd: number }[];
+  swapLiveOi?: { oiCcy: number; oiUsd: number; ts: number } | null;
   fundingCurrent8h: number | null;
   fundingHistory8h: number[];
   fetchedAt: number;
@@ -174,6 +247,7 @@ export type ScoringResult = {
   instId: string;
   mode: ScoringMode;
   evaluatedAt: number;
+  isReplay: boolean;
   lastClosed4hTs: number | null;
   lastClosed1hTs: number | null;
   lastClosed15mTs: number | null;
@@ -184,6 +258,14 @@ export type ScoringResult = {
   fundingStats90d: FundingStats90D | null;
   oiWindow: OpenInterestWindow | null;
   regimeLabel: string;
+  pivots1h: PivotAnchorOption[];
+  activeAvwapAnchor: PivotAnchorOption | null;
+  activeVpSelection: {
+    lock: VpLevelLock;
+    usedLabel: string;
+    levelPrice: number | null;
+  };
+  auxiliary: AuxiliaryMarketContext;
   parameters: ParameterScoreRow[];
   families: FamilySummary[];
   longEval: DirectionEvaluation;
@@ -191,6 +273,9 @@ export type ScoringResult = {
   dominantDirection: 'LONG' | 'SHORT' | 'NEUTRAL';
   excludedNotes: string[];
 };
+
+export type JournalEntryStatus = 'ABIERTA' | 'CERRADA' | 'OBSERVACION';
+export type JournalExitReason = 'TP1' | 'STOP' | 'TEMPORAL_16V' | 'MANUAL';
 
 export type ScoringJournalEntry = {
   id: string;
@@ -209,4 +294,73 @@ export type ScoringJournalEntry = {
   stopLoss: number | null;
   takeProfit: number | null;
   blockSummary: string;
+  directionTaken?: 'LONG' | 'SHORT';
+  chosenScore?: number;
+  isControlGroup?: boolean;
+  status?: JournalEntryStatus;
+  exitReason?: JournalExitReason;
+  exitPrice?: number | null;
+  closedAt?: number | null;
+  resultR?: number | null;
+  pnlUsd?: number | null;
+  costsInR?: number | null;
+  maeR?: number | null;
+  mfeR?: number | null;
+  riskBudgetUsd?: number | null;
+  notes?: string;
+};
+
+export type CalibrationBandStats = {
+  bandLabel: '[70, 80)' | '[80, 90)' | '[90, 100]' | '< 70';
+  closedTrades: number;
+  winRatePct: number;
+  expectancyR: number;
+  avgMaeR: number;
+  avgMfeR: number;
+};
+
+export type CalibrationGroupStats = {
+  label: string;
+  closedTrades: number;
+  wins: number;
+  winRatePct: number;
+  expectancyR: number;
+  profitFactor: number | null;
+  maxDrawdownR: number;
+  avgCostsR: number;
+  totalPnlUsd: number;
+  totalR: number;
+};
+
+export type CalibrationDashboardStats = {
+  totalEntries: number;
+  openCount: number;
+  closedCount: number;
+  filteredStats: CalibrationGroupStats;
+  controlStats: CalibrationGroupStats;
+  bandStats: CalibrationBandStats[];
+};
+
+export type HistoricalAuditRow = {
+  ts: number;
+  spot: number;
+  dominant: 'LONG' | 'SHORT';
+  score: number;
+  oppScore: number;
+  verdict: DirectionVerdict;
+  operable: boolean;
+  netRR: number | null;
+  forwardOutcome: 'TP1' | 'STOP' | 'TEMPORAL_16V' | 'PENDIENTE';
+  forwardR: number | null;
+  maeR: number | null;
+  mfeR: number | null;
+};
+
+export type HistoricalAuditSummary = {
+  rows: HistoricalAuditRow[];
+  evaluatedBars: number;
+  candidataCount: number;
+  candidataWinRatePct: number;
+  candidataExpectancyR: number;
+  controlExpectancyR: number;
 };

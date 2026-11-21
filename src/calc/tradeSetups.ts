@@ -5,7 +5,9 @@ import type {
   SymbolAsset,
   Timeframe,
   TradeOptionIdea,
+  TradeScoringAssessment,
 } from '../types/market';
+import type { ParameterPoints, ScoringResult } from '../types/scoring';
 import { calculateTouchProbability, type ConeProjection } from './cone';
 import { calculateEMAClouds, calculateRSI, calculateVWAP } from './indicators';
 
@@ -60,6 +62,217 @@ function getTouchProb(
   return Math.round(calculateTouchProbability(spot, target, iv, years) * 100);
 }
 
+function evaluateNetExecution(
+  idea: Pick<TradeOptionIdea, 'entry' | 'stopLoss' | 'takeProfit1' | 'quantity'>,
+  spreadPct: number,
+  feePctPerSide: number,
+  slippagePctPerSide: number,
+  expectedFundingCostPct: number
+): { netRR: number; costToRiskPct: number } {
+  const stopDist = Math.abs(idea.entry - idea.stopLoss);
+  const tpDist = Math.abs(idea.takeProfit1 - idea.entry);
+  if (stopDist <= 0 || idea.quantity <= 0) {
+    return { netRR: 0, costToRiskPct: 100 };
+  }
+  const perUnitRate =
+    (feePctPerSide * 2 + slippagePctPerSide * 2 + spreadPct + expectedFundingCostPct) / 100;
+  const costStop = idea.quantity * ((idea.entry + idea.stopLoss) * 0.5) * perUnitRate;
+  const costTarget = idea.quantity * ((idea.entry + idea.takeProfit1) * 0.5) * perUnitRate;
+  const grossRisk = idea.quantity * stopDist;
+  const grossReward = idea.quantity * tpDist;
+  const netRisk = grossRisk + costStop;
+  const netReward = grossReward - costTarget;
+  const netRR = netRisk > 0 ? netReward / netRisk : 0;
+  const costToRiskPct = grossRisk > 0 ? (100 * Math.max(costStop, costTarget)) / grossRisk : 100;
+  return { netRR, costToRiskPct };
+}
+
+function scoreNetRRPoints(netRR: number): ParameterPoints {
+  if (netRR >= 3.0) return 100;
+  if (netRR >= 2.5) return 75;
+  if (netRR >= 2.0) return 50;
+  if (netRR >= 1.5) return 25;
+  return 0;
+}
+
+function scoreCostRatioPoints(pct: number): ParameterPoints {
+  if (pct <= 5) return 100;
+  if (pct <= 10) return 75;
+  if (pct <= 15) return 50;
+  if (pct <= 20) return 25;
+  return 0;
+}
+
+function classifyBand(score: number, coveragePct: number): string {
+  if (coveragePct < 90) return 'INCOMPLETO';
+  if (score >= 90) return 'Candidata con alta confluencia';
+  if (score >= 80) return 'Candidata';
+  if (score >= 70) return 'Esperar mejor confirmación';
+  if (score >= 60) return 'Vigilancia';
+  return 'Descartar';
+}
+
+function buildIdeaScoringAssessment(
+  idea: TradeOptionIdea,
+  scoring: ScoringResult,
+  spreadPct: number,
+  feePctPerSide: number,
+  slippagePctPerSide: number
+): TradeScoringAssessment {
+  const isLong = idea.direction === 'LONG';
+  const dirEval = isLong ? scoring.longEval : scoring.shortEval;
+  const oppEval = isLong ? scoring.shortEval : scoring.longEval;
+
+  const { netRR, costToRiskPct } = evaluateNetExecution(
+    idea,
+    spreadPct,
+    feePctPerSide,
+    slippagePctPerSide,
+    scoring.mode === 'perpetual' ? 0.01 : 0
+  );
+
+  // Replace F1 (weight 8) and F2 (weight 4) with this specific trade card's actual Entry/SL/TP1 metrics
+  let availableWeight = 0;
+  let weightedSum = 0;
+  const fulfilledConditions: string[] = [];
+
+  for (const row of scoring.parameters) {
+    const res = isLong ? row.long : row.short;
+    if (!res.applicable) continue;
+    if (row.id === 'F1') {
+      const f1Pts = scoreNetRRPoints(netRR);
+      availableWeight += row.maxWeight;
+      weightedSum += (row.maxWeight * f1Pts) / 100;
+      if (f1Pts >= 75) fulfilledConditions.push(`F1 RR neto (${netRR.toFixed(2)}R)`);
+      continue;
+    }
+    if (row.id === 'F2') {
+      const f2Pts = scoreCostRatioPoints(costToRiskPct);
+      availableWeight += row.maxWeight;
+      weightedSum += (row.maxWeight * f2Pts) / 100;
+      if (f2Pts >= 75) fulfilledConditions.push(`F2 Costes (${costToRiskPct.toFixed(1)}%)`);
+      continue;
+    }
+    if (res.missing || res.points === null) continue;
+    availableWeight += row.maxWeight;
+    weightedSum += res.weightedPoints;
+    if (res.passed) {
+      fulfilledConditions.push(`${row.id} ${row.name} (${res.points})`);
+    }
+  }
+
+  const v11Score = availableWeight > 0 ? (weightedSum * 100) / availableWeight : 0;
+  const diffVsOpposite = v11Score - oppEval.score;
+
+  const a1Row = scoring.parameters.find((p) => p.id === 'A1');
+  const d1Row = scoring.parameters.find((p) => p.id === 'D1');
+  const a1Pts = (isLong ? a1Row?.long.points : a1Row?.short.points) ?? 0;
+  const d1Pts = (isLong ? d1Row?.long.points : d1Row?.short.points) ?? 0;
+
+  const blockReasons: string[] = [];
+  let hardBlock = false;
+
+  if (dirEval.coveragePct < 90) {
+    hardBlock = true;
+    blockReasons.push(`Cobertura < 90% (${dirEval.coveragePct.toFixed(1)}%)`);
+  }
+  if (netRR < 2.0) {
+    hardBlock = true;
+    blockReasons.push(`RR neto ${netRR.toFixed(2)} < 2.0 en TP1`);
+  }
+  if (costToRiskPct > 20) {
+    hardBlock = true;
+    blockReasons.push(`Costes ${costToRiskPct.toFixed(1)}% > 20% del riesgo`);
+  }
+  for (const b of dirEval.blocks) {
+    if (b.code === 'LIMITE_DIARIO' || b.code === 'RIESGO_CARTERA' || b.code === 'LIQUIDEZ_BOOK') {
+      hardBlock = true;
+      blockReasons.push(b.label);
+    }
+  }
+
+  if (a1Pts < 75) {
+    blockReasons.push(`A1 Estructura 4h = ${a1Pts} (< 75)`);
+  }
+  if (d1Pts < 75) {
+    blockReasons.push(`D1 Disparador 15m = ${d1Pts} (< 75)`);
+  }
+  if (v11Score < 80) {
+    blockReasons.push(`Puntuación ${v11Score.toFixed(1)} < 80`);
+  }
+  if (diffVsOpposite < 15) {
+    blockReasons.push(`Diferencia vs opuesta Δ ${diffVsOpposite.toFixed(1)} < 15`);
+  }
+
+  const operable =
+    !hardBlock &&
+    dirEval.coveragePct >= 90 &&
+    v11Score >= 80 &&
+    diffVsOpposite >= 15 &&
+    a1Pts >= 75 &&
+    d1Pts >= 75;
+
+  const verdict: TradeScoringAssessment['verdict'] = hardBlock
+    ? 'BLOQUEADA'
+    : operable
+    ? 'CANDIDATA'
+    : v11Score < 60
+    ? 'DESCARTADA'
+    : 'ESPERAR';
+
+  return {
+    v11Score,
+    baseDirectionScore: dirEval.score,
+    band: classifyBand(v11Score, dirEval.coveragePct),
+    verdict,
+    operable,
+    coveragePct: dirEval.coveragePct,
+    diffVsOpposite,
+    netRR,
+    costToRiskPct,
+    gates: [
+      {
+        id: 'score80',
+        label: 'Nota ≥ 80',
+        passed: v11Score >= 80,
+        valueText: v11Score.toFixed(1),
+      },
+      {
+        id: 'diff15',
+        label: 'Δ Opuesta ≥ 15',
+        passed: diffVsOpposite >= 15,
+        valueText: `${diffVsOpposite >= 0 ? '+' : ''}${diffVsOpposite.toFixed(1)}`,
+      },
+      {
+        id: 'a1',
+        label: 'A1 4h ≥ 75',
+        passed: a1Pts >= 75,
+        valueText: `${a1Pts}`,
+      },
+      {
+        id: 'd1',
+        label: 'D1 15m ≥ 75',
+        passed: d1Pts >= 75,
+        valueText: `${d1Pts}`,
+      },
+      {
+        id: 'rr2',
+        label: 'RR Neto ≥ 2.0',
+        passed: netRR >= 2.0,
+        valueText: `${netRR.toFixed(2)}R`,
+      },
+      {
+        id: 'cov90',
+        label: 'Cob. ≥ 90%',
+        passed: dirEval.coveragePct >= 90,
+        valueText: `${dirEval.coveragePct.toFixed(0)}%`,
+      },
+    ],
+    fulfilledConditions,
+    blockReasons,
+  };
+}
+
 export function generateTradingOptions(input: {
   asset: SymbolAsset;
   timeframe: Timeframe;
@@ -70,6 +283,10 @@ export function generateTradingOptions(input: {
   liquidity: LiquidityAnalysis;
   capitalUsd: number;
   riskPct: number;
+  scoring?: ScoringResult | null;
+  spreadPct?: number;
+  feePctPerSide?: number;
+  slippagePctPerSide?: number;
 }): TradeOptionIdea[] {
   const {
     asset,
@@ -80,6 +297,10 @@ export function generateTradingOptions(input: {
     liquidity,
     capitalUsd,
     riskPct,
+    scoring = null,
+    spreadPct = 0.02,
+    feePctPerSide = 0.05,
+    slippagePctPerSide = 0.02,
   } = input;
 
   if (candles.length < 15 || spot <= 0) return [];
@@ -447,5 +668,37 @@ export function generateTradingOptions(input: {
     });
   }
 
-  return ideas;
+  if (!scoring) {
+    return ideas;
+  }
+
+  const enriched = ideas.map((idea) => {
+    const assessment = buildIdeaScoringAssessment(
+      idea,
+      scoring,
+      spreadPct,
+      feePctPerSide,
+      slippagePctPerSide
+    );
+    return {
+      ...idea,
+      confidenceScore: Math.round(assessment.v11Score),
+      scoring: assessment,
+    };
+  });
+
+  // Sort by operability first (CANDIDATA > ESPERAR > BLOQUEADA > DESCARTADA), then exact v1.1 score
+  const rankOrder: Record<TradeScoringAssessment['verdict'], number> = {
+    CANDIDATA: 0,
+    ESPERAR: 1,
+    BLOQUEADA: 2,
+    DESCARTADA: 3,
+  };
+
+  return enriched.sort((a, b) => {
+    const ra = rankOrder[a.scoring!.verdict];
+    const rb = rankOrder[b.scoring!.verdict];
+    if (ra !== rb) return ra - rb;
+    return b.scoring!.v11Score - a.scoring!.v11Score;
+  });
 }

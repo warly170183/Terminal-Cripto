@@ -13,6 +13,7 @@ import type {
   TickerSnapshot,
   Timeframe,
 } from '../types/market';
+import type { PersistedScoringConfig } from '../types/scoring';
 import type { StreamConnectionStatus } from '../data/okxMarketClient';
 
 const STORAGE_KEYS = {
@@ -22,6 +23,23 @@ const STORAGE_KEYS = {
   userLevelsPrefix: 'wterm_levels_v1_',
   provider: 'wterm_provider_v1',
   candleTheme: 'wterm_candletheme_v1',
+  scoringConfig: 'wterm_scoring_config_v1',
+};
+
+const DEFAULT_SCORING_CONFIG: PersistedScoringConfig = {
+  mode: 'perpetual',
+  capitalUsd: 10000,
+  riskPct: 0.25,
+  feePctPerSide: 0.05,
+  slippagePctPerSide: 0.02,
+  expectedFundingCostPct: 0.01,
+  autoFundingFromLive: true,
+  leverage: 5,
+  dailyLossReached: false,
+  correlatedRiskExceeded: false,
+  vpLevelLock: 'auto',
+  avwapAnchorLockTs: null,
+  macroEventWindowHours: 2,
 };
 
 const DEFAULT_LAYERS: LayerVisibility = {
@@ -101,6 +119,9 @@ interface TerminalState {
   events: MacroEvent[];
   eventsModalOpen: boolean;
 
+  scoringConfig: PersistedScoringConfig;
+  setScoringConfig: (patch: Partial<PersistedScoringConfig>) => void;
+
   setActiveTab: (tab: ActiveWorkspaceTab) => void;
   setAsset: (asset: SymbolAsset) => void;
   setTimeframe: (tf: Timeframe) => void;
@@ -176,19 +197,35 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
   events: [],
   eventsModalOpen: false,
 
+  scoringConfig: {
+    ...DEFAULT_SCORING_CONFIG,
+    ...loadJson<Partial<PersistedScoringConfig>>(STORAGE_KEYS.scoringConfig, {}),
+  },
+  setScoringConfig: (patch) =>
+    set((state) => {
+      const next = { ...state.scoringConfig, ...patch };
+      saveJson(STORAGE_KEYS.scoringConfig, next);
+      return { scoringConfig: next };
+    }),
+
   setActiveTab: (activeTab) => set({ activeTab }),
   setAsset: (asset) => {
     saveJson(STORAGE_KEYS.asset, asset);
     const loadedLevels = loadJson<HorizontalLevel[]>(STORAGE_KEYS.userLevelsPrefix + asset, []);
-    set({
-      asset,
-      userLevels: loadedLevels,
-      selectedLevelId: null,
-      options: [],
-      optionTrades: [],
-      orderbook: null,
-      selectedExpiry: '',
-      ticker: null,
+    set((state) => {
+      const nextScoring = { ...state.scoringConfig, avwapAnchorLockTs: null };
+      saveJson(STORAGE_KEYS.scoringConfig, nextScoring);
+      return {
+        asset,
+        userLevels: loadedLevels,
+        selectedLevelId: null,
+        options: [],
+        optionTrades: [],
+        orderbook: null,
+        selectedExpiry: '',
+        ticker: null,
+        scoringConfig: nextScoring,
+      };
     });
   },
   setTimeframe: (timeframe) => {

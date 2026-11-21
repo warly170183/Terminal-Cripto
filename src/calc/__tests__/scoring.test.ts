@@ -1,7 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import type { Candle } from '../../types/market';
 import type { MultiTfScoringDataset, ScoringConfig } from '../../types/scoring';
-import { evaluateScoringSystem } from '../scoringEngine';
+import {
+  autoGradeJournalEntry,
+  computeCalibrationDashboard,
+} from '../scoringJournal';
+import { evaluateHistoricalAudit, evaluateScoringSystem } from '../scoringEngine';
 
 function buildTrendingCandles(
   count: number,
@@ -131,7 +135,7 @@ describe('Sistema de Puntuación v1.1', () => {
     const btcSpot = evaluateScoringSystem(
       {
         asset: 'BTC',
-        instId: 'BTC-USDT-SWAP',
+        instId: 'BTC-USDT',
         candles4h,
         candles1h,
         candles15m,
@@ -156,8 +160,6 @@ describe('Sistema de Puntuación v1.1', () => {
   });
 
   it('blocks evaluation as INCOMPLETO when coverage falls below 90%', () => {
-    // Only 30 1h candles => missing EMA200 (B1: 6), ATR percentile (D2: 4), OI (E1: 3), Funding (E2: 2)
-    // Available weight = 100 - 15 = 85% (< 90%)
     const candles4h = buildTrendingCandles(40, 4 * 3600_000, 60000, 75, 200, now);
     const candles1h = buildTrendingCandles(35, 3600_000, 62000, 22, 120, now);
     const candles15m = buildTrendingCandles(40, 15 * 60_000, 62800, 7, 45, now);
@@ -185,30 +187,108 @@ describe('Sistema de Puntuación v1.1', () => {
     expect(res.longEval.operable).toBe(false);
   });
 
-  it('enforces daily loss limit hard block even on strong setups', () => {
+  it('enforces §11 hard blocks for daily loss, high-impact macro event, stale data, and liquidation before stop', () => {
+    const bull4h = buildTrendingCandles(120, 4 * 3600_000, 50000, 95, 1200, now);
+    const bull1h = buildTrendingCandles(280, 3600_000, 54000, 28, 1600, now);
+    const bull15m = buildTrendingCandles(140, 15 * 60_000, 60800, 10, 1400, now);
+    const ds: MultiTfScoringDataset = {
+      asset: 'ETH',
+      instId: 'ETH-USDT-SWAP',
+      candles4h: bull4h,
+      candles1h: bull1h,
+      candles15m: bull15m,
+      btcCandles4h: bull4h,
+      orderbook: null,
+      oiSeries1h: bull1h.slice(-10).map((c, idx) => ({ ts: c.t, oiUsd: (2000 + idx * 90) * c.c })),
+      fundingCurrent8h: 0.0001,
+      fundingHistory8h: Array.from({ length: 120 }, (_, i) => (i - 60) * 0.00001),
+      fetchedAt: now,
+    };
+
+    const blockedRes = evaluateScoringSystem(ds, {
+      ...DEFAULT_CONFIG,
+      dailyLossReached: true,
+      leverage: 50,
+      macroEventWindowHours: 2,
+      upcomingEvents: [{ id: 'ev1', date: '2026-11-19', timeUtc: '21:00', ts: now + 3600_000, name: 'CPI US' }],
+    });
+
+    expect(blockedRes.longEval.verdict).toBe('BLOQUEADA');
+    expect(blockedRes.longEval.blocks.some((b) => b.code === 'LIMITE_DIARIO')).toBe(true);
+    expect(blockedRes.longEval.blocks.some((b) => b.code === 'EVENTO_MACRO')).toBe(true);
+    expect(blockedRes.longEval.blocks.some((b) => b.code === 'LIQUIDACION_STOP')).toBe(true);
+
+    const staleRes = evaluateScoringSystem({ ...ds, fetchedAt: now + 60 * 60_000 }, DEFAULT_CONFIG);
+    expect(staleRes.longEval.blocks.some((b) => b.code === 'DATOS_DESACTUALIZADOS')).toBe(true);
+  });
+
+  it('supports pre-locked C3/C2 anchors, Gap-to-80 analysis, causal historical audit, and §14 calibration stats', () => {
     const bull4h = buildTrendingCandles(120, 4 * 3600_000, 50000, 95, 240, now);
     const bull1h = buildTrendingCandles(280, 3600_000, 54000, 28, 120, now);
     const bull15m = buildTrendingCandles(140, 15 * 60_000, 60800, 10, 45, now);
 
-    const res = evaluateScoringSystem(
-      {
-        asset: 'ETH',
-        instId: 'ETH-USDT-SWAP',
-        candles4h: bull4h,
-        candles1h: bull1h,
-        candles15m: bull15m,
-        btcCandles4h: bull4h,
-        orderbook: null,
-        oiSeries1h: bull1h.slice(-10).map((c, idx) => ({ ts: c.t, oiUsd: (2000 + idx * 90) * c.c })),
-        fundingCurrent8h: 0.0001,
-        fundingHistory8h: Array.from({ length: 120 }, (_, i) => (i - 60) * 0.00001),
-        fetchedAt: now,
-      },
-      { ...DEFAULT_CONFIG, dailyLossReached: true }
-    );
+    const ds: MultiTfScoringDataset = {
+      asset: 'BTC',
+      instId: 'BTC-USDT-SWAP',
+      candles4h: bull4h,
+      candles1h: bull1h,
+      candles15m: bull15m,
+      btcCandles4h: bull4h,
+      orderbook: null,
+      oiSeries1h: bull1h.slice(-10).map((c, idx) => ({ ts: c.t, oiUsd: (2000 + idx * 90) * c.c })),
+      fundingCurrent8h: 0.0001,
+      fundingHistory8h: Array.from({ length: 120 }, (_, i) => (i - 60) * 0.00001),
+      fetchedAt: now,
+    };
 
-    expect(res.longEval.verdict).toBe('BLOQUEADA');
-    expect(res.longEval.operable).toBe(false);
-    expect(res.longEval.blocks.some((b) => b.code === 'LIMITE_DIARIO')).toBe(true);
+    const res = evaluateScoringSystem(ds, { ...DEFAULT_CONFIG, vpLevelLock: 'VAH' });
+    expect(res.activeVpSelection.lock).toBe('VAH');
+    expect(res.activeVpSelection.usedLabel).toContain('VAH');
+    expect(res.shortEval.gapTo80.pointsNeeded).toBeGreaterThan(0);
+
+    const audit = evaluateHistoricalAudit(ds, DEFAULT_CONFIG, 12);
+    expect(audit.evaluatedBars).toBeGreaterThan(0);
+    expect(audit.rows[0].forwardOutcome).not.toBe('PENDIENTE');
+
+    // Auto-grade a sample open journal entry across 16 closed 15m bars & compute §14 calibration
+    const entryTs = bull15m[bull15m.length - 20].t;
+    const entryPx = bull15m[bull15m.length - 20].c;
+    const graded = autoGradeJournalEntry(
+      {
+        id: 'j-1',
+        ts: entryTs,
+        asset: 'BTC',
+        mode: 'perpetual',
+        spot: entryPx,
+        longScore: 84,
+        shortScore: 40,
+        longVerdict: 'CANDIDATA',
+        shortVerdict: 'DESCARTADA',
+        dominant: 'LONG',
+        coveragePct: 100,
+        netRR: 2.4,
+        entry: entryPx,
+        stopLoss: entryPx - 120,
+        takeProfit: entryPx + 260,
+        blockSummary: 'Sin bloqueos',
+        directionTaken: 'LONG',
+        chosenScore: 84,
+        isControlGroup: false,
+        status: 'ABIERTA',
+        riskBudgetUsd: 25,
+      },
+      bull15m,
+      0.05,
+      0.02,
+      0.01
+    );
+    expect(graded).not.toBeNull();
+    expect(graded!.status).toBe('CERRADA');
+    expect(typeof graded!.resultR).toBe('number');
+
+    const cal = computeCalibrationDashboard([graded!]);
+    expect(cal.closedCount).toBe(1);
+    expect(cal.filteredStats.closedTrades).toBe(1);
+    expect(cal.bandStats.find((b) => b.bandLabel === '[80, 90)')?.closedTrades).toBe(1);
   });
 });

@@ -134,6 +134,28 @@ export type LiquidityAnalysis = {
   imbalancePct: number;
 };
 
+export type TradeScoringGateCheck = {
+  id: string;
+  label: string;
+  passed: boolean;
+  valueText: string;
+};
+
+export type TradeScoringAssessment = {
+  v11Score: number;
+  baseDirectionScore: number;
+  band: string;
+  verdict: 'CANDIDATA' | 'ESPERAR' | 'BLOQUEADA' | 'DESCARTADA';
+  operable: boolean;
+  coveragePct: number;
+  diffVsOpposite: number;
+  netRR: number;
+  costToRiskPct: number;
+  gates: TradeScoringGateCheck[];
+  fulfilledConditions: string[];
+  blockReasons: string[];
+};
+
 export type TradeOptionIdea = {
   id: string;
   title: string;
@@ -156,6 +178,7 @@ export type TradeOptionIdea = {
   slReason: string;
   summary: string;
   confluences: string[];
+  scoring?: TradeScoringAssessment;
 };
 
 export type OptionTradeRow = {

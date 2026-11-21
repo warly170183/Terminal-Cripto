@@ -1,5 +1,10 @@
-import type { Candle, SymbolAsset } from '../types/market';
-import type { MultiTfScoringDataset } from '../types/scoring';
+import type {
+  Candle,
+  OrderbookDepthData,
+  OrderbookWall,
+  SymbolAsset,
+} from '../types/market';
+import type { MultiTfScoringDataset, ScoringMode } from '../types/scoring';
 import { fetchOrderbookWalls } from './okxMarketClient';
 
 type OkxResponse<T> = {
@@ -8,10 +13,11 @@ type OkxResponse<T> = {
   data: T[];
 };
 
-async function fetchClosedSwapCandles(
+async function fetchClosedMarketCandles(
   instId: string,
   bar: '4H' | '1H' | '15m',
   limit: number,
+  isSpot: boolean,
   signal?: AbortSignal
 ): Promise<Candle[]> {
   const res = await fetch(
@@ -36,8 +42,8 @@ async function fetchClosedSwapCandles(
       h: Number(row[2]),
       l: Number(row[3]),
       c: Number(row[4]),
-      // row[6] is volCcy (base currency volume, e.g. BTC or ETH)
-      v: Number(row[6] ?? row[5] ?? 0),
+      // Spot candles: row[5] is base currency volume (BTC/ETH); SWAP: row[6] (volCcy) is base currency
+      v: isSpot ? Number(row[5] ?? 0) : Number(row[6] ?? row[5] ?? 0),
     }))
     .filter(
       (c) =>
@@ -49,6 +55,99 @@ async function fetchClosedSwapCandles(
         c.c > 0
     )
     .sort((a, b) => a.t - b.t);
+}
+
+async function fetchOrderbookForInst(
+  instId: string,
+  asset: SymbolAsset,
+  isSpot: boolean,
+  signal?: AbortSignal
+): Promise<OrderbookDepthData | null> {
+  if (isSpot) {
+    return fetchOrderbookWalls(asset, signal).catch(() => null);
+  }
+  try {
+    const res = await fetch(`/api/okx/market/books?instId=${instId}&sz=400`, { signal });
+    if (!res.ok) return fetchOrderbookWalls(asset, signal).catch(() => null);
+    const json = (await res.json()) as OkxResponse<{
+      asks: [string, string, string, string][];
+      bids: [string, string, string, string][];
+      ts: string;
+    }>;
+    if (json.code !== '0' || !json.data || json.data.length === 0) {
+      return fetchOrderbookWalls(asset, signal).catch(() => null);
+    }
+
+    const book = json.data[0];
+    const bestAsk = book.asks[0] ? Number(book.asks[0][0]) : 0;
+    const bestBid = book.bids[0] ? Number(book.bids[0][0]) : 0;
+    const mid = bestBid > 0 && bestAsk > 0 ? (bestBid + bestAsk) / 2 : bestAsk || bestBid;
+    if (mid <= 0) return fetchOrderbookWalls(asset, signal).catch(() => null);
+
+    // OKX SWAP book sz is in contracts; contract multiplier for BTC-USDT-SWAP is 0.01 BTC, ETH-USDT-SWAP is 0.1 ETH
+    const ctVal = asset === 'BTC' ? 0.01 : 0.1;
+    const bucketStep = mid >= 10_000 ? 150 : 5;
+    const askBuckets = new Map<number, number>();
+    const bidBuckets = new Map<number, number>();
+    let askTotalUsd = 0;
+    let bidTotalUsd = 0;
+
+    for (const [pStr, szStr] of book.asks) {
+      const p = Number(pStr);
+      const szCoins = Number(szStr) * ctVal;
+      if (!Number.isFinite(p) || !Number.isFinite(szCoins) || p <= 0 || szCoins <= 0) continue;
+      askTotalUsd += p * szCoins;
+      const bucket = Math.ceil(p / bucketStep) * bucketStep;
+      askBuckets.set(bucket, (askBuckets.get(bucket) ?? 0) + szCoins);
+    }
+
+    for (const [pStr, szStr] of book.bids) {
+      const p = Number(pStr);
+      const szCoins = Number(szStr) * ctVal;
+      if (!Number.isFinite(p) || !Number.isFinite(szCoins) || p <= 0 || szCoins <= 0) continue;
+      bidTotalUsd += p * szCoins;
+      const bucket = Math.floor(p / bucketStep) * bucketStep;
+      bidBuckets.set(bucket, (bidBuckets.get(bucket) ?? 0) + szCoins);
+    }
+
+    const topAsks: OrderbookWall[] = Array.from(askBuckets.entries())
+      .map(([price, sizeCoins]) => ({
+        price,
+        sizeCoins,
+        notionalUsd: price * sizeCoins,
+        distancePct: ((price - mid) / mid) * 100,
+        side: 'ask' as const,
+      }))
+      .sort((a, b) => b.notionalUsd - a.notionalUsd)
+      .slice(0, 6);
+
+    const topBids: OrderbookWall[] = Array.from(bidBuckets.entries())
+      .map(([price, sizeCoins]) => ({
+        price,
+        sizeCoins,
+        notionalUsd: price * sizeCoins,
+        distancePct: ((price - mid) / mid) * 100,
+        side: 'bid' as const,
+      }))
+      .sort((a, b) => b.notionalUsd - a.notionalUsd)
+      .slice(0, 6);
+
+    const tot = bidTotalUsd + askTotalUsd;
+    const imbalancePct = tot > 0 ? ((bidTotalUsd - askTotalUsd) / tot) * 100 : 0;
+
+    return {
+      bestBid,
+      bestAsk,
+      spreadPct: bestBid > 0 ? ((bestAsk - bestBid) / bestBid) * 100 : 0,
+      bidTotalUsd,
+      askTotalUsd,
+      imbalancePct,
+      walls: [...topAsks, ...topBids].sort((a, b) => b.price - a.price),
+      ts: Number(book.ts) || Date.now(),
+    };
+  } catch {
+    return fetchOrderbookWalls(asset, signal).catch(() => null);
+  }
 }
 
 async function fetchOpenInterest1hSeries(
@@ -75,6 +174,37 @@ async function fetchOpenInterest1hSeries(
   }
 }
 
+async function fetchSwapLiveOpenInterest(
+  instId: string,
+  signal?: AbortSignal
+): Promise<{ oiCcy: number; oiUsd: number; ts: number } | null> {
+  try {
+    const res = await fetch(
+      `/api/okx/public/open-interest?instType=SWAP&instId=${instId}`,
+      { signal }
+    );
+    if (!res.ok) return null;
+    const json = (await res.json()) as OkxResponse<{
+      instId: string;
+      oiCcy: string;
+      oiUsd?: string;
+      ts: string;
+    }>;
+    if (json.code !== '0' || !json.data || !json.data[0]) return null;
+    const row = json.data[0];
+    const oiCcy = Number(row.oiCcy);
+    const oiUsd = Number(row.oiUsd ?? 0);
+    if (!Number.isFinite(oiCcy) || oiCcy <= 0) return null;
+    return {
+      oiCcy,
+      oiUsd: Number.isFinite(oiUsd) ? oiUsd : 0,
+      ts: Number(row.ts) || Date.now(),
+    };
+  } catch {
+    return null;
+  }
+}
+
 async function fetchFundingRateSnapshot(
   instId: string,
   signal?: AbortSignal
@@ -91,7 +221,6 @@ async function fetchFundingRateSnapshot(
       if (curJson.code === '0' && curJson.data[0]) {
         const raw = Number(curJson.data[0].fundingRate);
         if (Number.isFinite(raw)) {
-          // OKX perpetual funding is settled every 8h; normalize if interval differs
           const intervalMs =
             Number(curJson.data[0].nextFundingTime) - Number(curJson.data[0].fundingTime);
           const hours = intervalMs > 0 ? intervalMs / 3_600_000 : 8;
@@ -136,9 +265,17 @@ async function fetchFundingRateSnapshot(
 
 export async function fetchScoringDataset(
   asset: SymbolAsset,
-  signal?: AbortSignal
+  modeOrSignal?: ScoringMode | AbortSignal,
+  maybeSignal?: AbortSignal
 ): Promise<MultiTfScoringDataset> {
-  const instId = `${asset}-USDT-SWAP`;
+  const mode: ScoringMode =
+    typeof modeOrSignal === 'string' ? modeOrSignal : 'perpetual';
+  const signal: AbortSignal | undefined =
+    typeof modeOrSignal === 'string' ? maybeSignal : modeOrSignal;
+
+  const isSpot = mode === 'spot';
+  const instId = isSpot ? `${asset}-USDT` : `${asset}-USDT-SWAP`;
+  const btcInstId = isSpot ? 'BTC-USDT' : 'BTC-USDT-SWAP';
 
   const [
     candles4h,
@@ -147,17 +284,21 @@ export async function fetchScoringDataset(
     btcCandles4h,
     orderbook,
     oiSeries1h,
+    swapLiveOi,
     funding,
   ] = await Promise.all([
-    fetchClosedSwapCandles(instId, '4H', 260, signal),
-    fetchClosedSwapCandles(instId, '1H', 300, signal),
-    fetchClosedSwapCandles(instId, '15m', 220, signal),
+    fetchClosedMarketCandles(instId, '4H', 260, isSpot, signal),
+    fetchClosedMarketCandles(instId, '1H', 300, isSpot, signal),
+    fetchClosedMarketCandles(instId, '15m', 220, isSpot, signal),
     asset === 'BTC'
       ? Promise.resolve<Candle[]>([])
-      : fetchClosedSwapCandles('BTC-USDT-SWAP', '4H', 120, signal),
-    fetchOrderbookWalls(asset, signal).catch(() => null),
-    fetchOpenInterest1hSeries(asset, signal),
-    fetchFundingRateSnapshot(instId, signal),
+      : fetchClosedMarketCandles(btcInstId, '4H', 120, isSpot, signal),
+    fetchOrderbookForInst(instId, asset, isSpot, signal),
+    isSpot ? Promise.resolve([]) : fetchOpenInterest1hSeries(asset, signal),
+    isSpot ? Promise.resolve(null) : fetchSwapLiveOpenInterest(`${asset}-USDT-SWAP`, signal),
+    isSpot
+      ? Promise.resolve({ current8h: null, history8h: [] })
+      : fetchFundingRateSnapshot(`${asset}-USDT-SWAP`, signal),
   ]);
 
   return {
@@ -169,6 +310,7 @@ export async function fetchScoringDataset(
     btcCandles4h: asset === 'BTC' ? candles4h : btcCandles4h,
     orderbook,
     oiSeries1h,
+    swapLiveOi,
     fundingCurrent8h: funding.current8h,
     fundingHistory8h: funding.history8h,
     fetchedAt: Date.now(),
